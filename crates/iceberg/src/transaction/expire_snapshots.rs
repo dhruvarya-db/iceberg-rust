@@ -168,12 +168,33 @@ impl TransactionAction for ExpireSnapshotsAction {
             return Ok(ActionCommit::new(vec![], vec![]));
         }
 
-        Ok(ActionCommit::new(
-            vec![TableUpdate::RemoveSnapshots { snapshot_ids }],
-            vec![TableRequirement::UuidMatch {
-                uuid: table.metadata().uuid(),
-            }],
-        ))
+        let metadata = table.metadata();
+        let mut updates = vec![TableUpdate::RemoveSnapshots {
+            snapshot_ids: snapshot_ids.clone(),
+        }];
+
+        // Drop statistics tied to expired snapshots so metadata holds no dangling references.
+        for snapshot_id in &snapshot_ids {
+            if metadata.statistics_for_snapshot(*snapshot_id).is_some() {
+                updates.push(TableUpdate::RemoveStatistics {
+                    snapshot_id: *snapshot_id,
+                });
+            }
+            if metadata
+                .partition_statistics_for_snapshot(*snapshot_id)
+                .is_some()
+            {
+                updates.push(TableUpdate::RemovePartitionStatistics {
+                    snapshot_id: *snapshot_id,
+                });
+            }
+        }
+
+        Ok(ActionCommit::new(updates, vec![
+            TableRequirement::UuidMatch {
+                uuid: metadata.uuid(),
+            },
+        ]))
     }
 }
 
@@ -281,6 +302,44 @@ mod tests {
     #[tokio::test]
     async fn test_retain_last_noop_when_enough_retained() {
         assert!(removed_ids(action().retain_last(5)).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_expire_removes_statistics_of_expired_snapshot() {
+        use std::sync::Arc;
+
+        use crate::spec::StatisticsFile;
+
+        let table = make_v2_table();
+        let metadata = table
+            .metadata()
+            .clone()
+            .into_builder(None)
+            .set_statistics(StatisticsFile {
+                snapshot_id: OLD_SNAPSHOT,
+                statistics_path: "stats/old.puffin".to_string(),
+                file_size_in_bytes: 1,
+                file_footer_size_in_bytes: 1,
+                key_metadata: None,
+                blob_metadata: vec![],
+            })
+            .build()
+            .unwrap()
+            .metadata;
+        let table = table.with_metadata(Arc::new(metadata));
+
+        let mut commit = Arc::new(action().expire_snapshot_ids(vec![OLD_SNAPSHOT]))
+            .commit(&table)
+            .await
+            .unwrap();
+
+        assert!(
+            commit
+                .take_updates()
+                .contains(&TableUpdate::RemoveStatistics {
+                    snapshot_id: OLD_SNAPSHOT,
+                })
+        );
     }
 
     #[tokio::test]

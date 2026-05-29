@@ -42,6 +42,8 @@ pub struct UnreferencedFiles {
     pub manifests: Vec<String>,
     /// Data and delete files no longer reachable from any retained snapshot.
     pub data_files: Vec<String>,
+    /// Statistics and partition-statistics files of the expired snapshots.
+    pub statistics_files: Vec<String>,
 }
 
 /// Computes the files that would become unreferenced if `expired_snapshot_ids` were removed.
@@ -59,11 +61,30 @@ pub async fn unreferenced_files(
     let retained = reachable_files(io, metadata, |id| !expired_snapshot_ids.contains(&id)).await?;
     let expired = reachable_files(io, metadata, |id| expired_snapshot_ids.contains(&id)).await?;
 
+    let expired_statistics = statistics_paths(metadata, |id| expired_snapshot_ids.contains(&id));
+    let retained_statistics = statistics_paths(metadata, |id| !expired_snapshot_ids.contains(&id));
+
     Ok(UnreferencedFiles {
         manifest_lists: difference(expired.manifest_lists, &retained.manifest_lists),
         manifests: difference(expired.manifests, &retained.manifests),
         data_files: difference(expired.data_files, &retained.data_files),
+        statistics_files: difference(expired_statistics, &retained_statistics),
     })
+}
+
+/// Statistics and partition-statistics file paths of the snapshots selected by `include`.
+fn statistics_paths(metadata: &TableMetadata, include: impl Fn(i64) -> bool) -> HashSet<String> {
+    metadata
+        .statistics_iter()
+        .filter(|file| include(file.snapshot_id))
+        .map(|file| file.statistics_path.clone())
+        .chain(
+            metadata
+                .partition_statistics_iter()
+                .filter(|file| include(file.snapshot_id))
+                .map(|file| file.statistics_path.clone()),
+        )
+        .collect()
 }
 
 /// All files reachable from the snapshots selected by `include`.
@@ -146,6 +167,7 @@ pub struct ExpireSnapshotsResult {
     pub deleted_manifest_lists: usize,
     pub deleted_manifests: usize,
     pub deleted_data_files: usize,
+    pub deleted_statistics_files: usize,
     /// Whether this was a preview that performed no commit or deletion.
     pub dry_run: bool,
 }
@@ -239,7 +261,7 @@ impl ExpireSnapshots {
         let files = unreferenced_files(&self.table, &expired_set).await?;
         let gc_enabled = self.table.metadata().table_properties()?.gc_enabled;
 
-        let mut result = ExpireSnapshotsResult {
+        let result = ExpireSnapshotsResult {
             expired_snapshot_ids: expired_ids.clone(),
             deleted_manifest_lists: files.manifest_lists.len(),
             deleted_manifests: files.manifests.len(),
@@ -248,6 +270,7 @@ impl ExpireSnapshots {
             } else {
                 0
             },
+            deleted_statistics_files: files.statistics_files.len(),
             dry_run: self.dry_run,
         };
 
@@ -263,10 +286,11 @@ impl ExpireSnapshots {
 
         let mut to_delete = files.manifest_lists;
         to_delete.extend(files.manifests);
+        // Statistics files belong to a single snapshot and are never shared across tables, so
+        // they are deleted regardless of `gc.enabled` (unlike data files).
+        to_delete.extend(files.statistics_files);
         if gc_enabled {
             to_delete.extend(files.data_files);
-        } else {
-            result.deleted_data_files = 0;
         }
         self.delete_files(to_delete).await?;
 
@@ -289,7 +313,9 @@ mod tests {
     use std::collections::{HashMap, HashSet};
 
     use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
-    use iceberg::spec::{DataContentType, DataFileBuilder, DataFileFormat, FormatVersion, Struct};
+    use iceberg::spec::{
+        DataContentType, DataFileBuilder, DataFileFormat, FormatVersion, StatisticsFile, Struct,
+    };
     use iceberg::transaction::{ApplyTransactionAction, Transaction};
     use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation};
 
@@ -351,6 +377,29 @@ mod tests {
 
     fn current_id(table: &Table) -> i64 {
         table.metadata().current_snapshot_id().unwrap()
+    }
+
+    async fn set_statistics(
+        catalog: &impl Catalog,
+        table: &Table,
+        snapshot_id: i64,
+        path: &str,
+    ) -> Table {
+        let tx = Transaction::new(table);
+        tx.update_statistics()
+            .set_statistics(StatisticsFile {
+                snapshot_id,
+                statistics_path: path.to_string(),
+                file_size_in_bytes: 1,
+                file_footer_size_in_bytes: 1,
+                key_metadata: None,
+                blob_metadata: vec![],
+            })
+            .apply(tx)
+            .unwrap()
+            .commit(catalog)
+            .await
+            .unwrap()
     }
 
     #[tokio::test]
@@ -466,5 +515,37 @@ mod tests {
         assert!(io.exists(&oldest_manifest_list).await.unwrap());
         let reloaded = catalog.load_table(table.identifier()).await.unwrap();
         assert_eq!(reloaded.metadata().snapshots().count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_expire_removes_statistics_of_expired_snapshot() {
+        let catalog = memory_catalog().await;
+        let table = empty_table(&catalog).await;
+        let table = append(&catalog, &table, "data/1.parquet").await;
+        let oldest = current_id(&table);
+        let table = set_statistics(&catalog, &table, oldest, "stats/oldest.puffin").await;
+        let table = append(&catalog, &table, "data/2.parquet").await;
+
+        let files = unreferenced_files(&table, &HashSet::from([oldest]))
+            .await
+            .unwrap();
+        assert_eq!(files.statistics_files, vec![
+            "stats/oldest.puffin".to_string()
+        ]);
+
+        let result = ExpireSnapshots::new(table.clone())
+            .expire_snapshot_ids(vec![oldest])
+            .execute(&catalog)
+            .await
+            .unwrap();
+
+        assert_eq!(result.deleted_statistics_files, 1);
+        let reloaded = catalog.load_table(table.identifier()).await.unwrap();
+        assert!(
+            reloaded
+                .metadata()
+                .statistics_for_snapshot(oldest)
+                .is_none()
+        );
     }
 }
