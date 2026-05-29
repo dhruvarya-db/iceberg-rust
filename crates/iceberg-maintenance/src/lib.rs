@@ -22,4 +22,6 @@
 
 mod expire_snapshots;
 
-pub use expire_snapshots::{UnreferencedFiles, unreferenced_files};
+pub use expire_snapshots::{
+    ExpireSnapshots, ExpireSnapshotsResult, UnreferencedFiles, unreferenced_files,
+};
