@@ -21,10 +21,14 @@ use futures::{StreamExt, TryStreamExt, future, stream};
 use iceberg::io::FileIO;
 use iceberg::spec::{ManifestFile, SnapshotRef, TableMetadata};
 use iceberg::table::Table;
-use iceberg::{Error, Result};
+use iceberg::transaction::{ApplyTransactionAction, Transaction};
+use iceberg::{Catalog, Error, Result};
 
 /// Number of manifests to read concurrently, matching `catalog::utils::drop_table_data`.
 const READ_CONCURRENCY: usize = 10;
+
+/// Default upper bound on concurrent file deletions.
+const DEFAULT_MAX_CONCURRENT_DELETES: usize = 4;
 
 /// Files that become unreferenced once a set of snapshots is expired.
 ///
@@ -131,6 +135,153 @@ fn difference(candidates: HashSet<String>, retained: &HashSet<String>) -> Vec<St
         .into_iter()
         .filter(|path| !retained.contains(path))
         .collect()
+}
+
+/// Outcome of an [`ExpireSnapshots`] run. Counts reflect what was deleted, or what *would* be
+/// deleted for a [`dry_run`](ExpireSnapshots::dry_run).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ExpireSnapshotsResult {
+    /// Snapshots removed from table metadata.
+    pub expired_snapshot_ids: Vec<i64>,
+    pub deleted_manifest_lists: usize,
+    pub deleted_manifests: usize,
+    pub deleted_data_files: usize,
+    /// Whether this was a preview that performed no commit or deletion.
+    pub dry_run: bool,
+}
+
+/// Expires table snapshots and deletes the files they leave behind.
+///
+/// This both commits a new metadata version with the snapshots removed (via the core
+/// [`expire_snapshots`](iceberg::transaction::Transaction::expire_snapshots) action) and deletes
+/// the now-unreferenced files. Selection follows the same rules as that action: explicit ids, or
+/// age plus `retain_last`, never the current snapshot.
+///
+/// Data and delete files are only removed when the `gc.enabled` table property is set, mirroring
+/// [`iceberg::drop_table_data`].
+pub struct ExpireSnapshots {
+    table: Table,
+    snapshot_ids: Vec<i64>,
+    older_than_ms: Option<i64>,
+    retain_last: Option<usize>,
+    dry_run: bool,
+    max_concurrent_deletes: usize,
+}
+
+impl ExpireSnapshots {
+    pub fn new(table: Table) -> Self {
+        Self {
+            table,
+            snapshot_ids: vec![],
+            older_than_ms: None,
+            retain_last: None,
+            dry_run: false,
+            max_concurrent_deletes: DEFAULT_MAX_CONCURRENT_DELETES,
+        }
+    }
+
+    /// Expire exactly these snapshot ids, ignoring the age and `retain_last` filters.
+    pub fn expire_snapshot_ids(mut self, snapshot_ids: Vec<i64>) -> Self {
+        self.snapshot_ids = snapshot_ids;
+        self
+    }
+
+    /// Expire snapshots whose timestamp is strictly older than `older_than_ms`.
+    pub fn expire_older_than_ms(mut self, older_than_ms: i64) -> Self {
+        self.older_than_ms = Some(older_than_ms);
+        self
+    }
+
+    /// Retain at least the `retain_last` most recent snapshots (defaults to 1).
+    pub fn retain_last(mut self, retain_last: usize) -> Self {
+        self.retain_last = Some(retain_last);
+        self
+    }
+
+    /// Preview the operation without committing or deleting anything.
+    pub fn dry_run(mut self, dry_run: bool) -> Self {
+        self.dry_run = dry_run;
+        self
+    }
+
+    /// Upper bound on concurrent file deletions (clamped to at least 1).
+    pub fn max_concurrent_deletes(mut self, max_concurrent_deletes: usize) -> Self {
+        self.max_concurrent_deletes = max_concurrent_deletes.max(1);
+        self
+    }
+
+    /// Snapshot ids that would be expired, reusing the core action's selection rules.
+    fn snapshot_ids_to_expire(&self) -> Result<Vec<i64>> {
+        // The action type is reachable only through `Transaction`, so build it inline.
+        let mut action = Transaction::new(&self.table).expire_snapshots();
+        if !self.snapshot_ids.is_empty() {
+            action = action.expire_snapshot_ids(self.snapshot_ids.clone());
+        }
+        if let Some(older_than_ms) = self.older_than_ms {
+            action = action.expire_older_than_ms(older_than_ms);
+        }
+        if let Some(retain_last) = self.retain_last {
+            action = action.retain_last(retain_last);
+        }
+        action.snapshot_ids_to_expire(&self.table)
+    }
+
+    pub async fn execute(self, catalog: &dyn Catalog) -> Result<ExpireSnapshotsResult> {
+        let expired_ids = self.snapshot_ids_to_expire()?;
+        if expired_ids.is_empty() {
+            return Ok(ExpireSnapshotsResult {
+                dry_run: self.dry_run,
+                ..Default::default()
+            });
+        }
+
+        let expired_set: HashSet<i64> = expired_ids.iter().copied().collect();
+        let files = unreferenced_files(&self.table, &expired_set).await?;
+        let gc_enabled = self.table.metadata().table_properties()?.gc_enabled;
+
+        let mut result = ExpireSnapshotsResult {
+            expired_snapshot_ids: expired_ids.clone(),
+            deleted_manifest_lists: files.manifest_lists.len(),
+            deleted_manifests: files.manifests.len(),
+            deleted_data_files: if gc_enabled {
+                files.data_files.len()
+            } else {
+                0
+            },
+            dry_run: self.dry_run,
+        };
+
+        if self.dry_run {
+            return Ok(result);
+        }
+
+        // Commit the removal with explicit ids so the committed set matches the files computed
+        // above. File deletion only happens after the metadata commit succeeds.
+        let tx = Transaction::new(&self.table);
+        let action = tx.expire_snapshots().expire_snapshot_ids(expired_ids);
+        action.apply(tx)?.commit(catalog).await?;
+
+        let mut to_delete = files.manifest_lists;
+        to_delete.extend(files.manifests);
+        if gc_enabled {
+            to_delete.extend(files.data_files);
+        } else {
+            result.deleted_data_files = 0;
+        }
+        self.delete_files(to_delete).await?;
+
+        Ok(result)
+    }
+
+    async fn delete_files(&self, paths: Vec<String>) -> Result<()> {
+        let io = self.table.file_io().clone();
+        stream::iter(paths.into_iter().map(Ok::<_, Error>))
+            .try_for_each_concurrent(self.max_concurrent_deletes, |path| {
+                let io = io.clone();
+                async move { io.delete(&path).await }
+            })
+            .await
+    }
 }
 
 #[cfg(test)]
@@ -247,5 +398,73 @@ mod tests {
 
         let files = unreferenced_files(&table, &HashSet::new()).await.unwrap();
         assert_eq!(files, UnreferencedFiles::default());
+    }
+
+    fn manifest_list_path(table: &Table, snapshot_id: i64) -> String {
+        table
+            .metadata()
+            .snapshot_by_id(snapshot_id)
+            .unwrap()
+            .manifest_list()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn test_execute_expires_snapshots_and_deletes_files() {
+        let catalog = memory_catalog().await;
+        let table = empty_table(&catalog).await;
+        let table = append(&catalog, &table, "data/1.parquet").await;
+        let oldest = current_id(&table);
+        let table = append(&catalog, &table, "data/2.parquet").await;
+        let table = append(&catalog, &table, "data/3.parquet").await;
+        let current = current_id(&table);
+
+        let io = table.file_io().clone();
+        let oldest_manifest_list = manifest_list_path(&table, oldest);
+        assert!(io.exists(&oldest_manifest_list).await.unwrap());
+
+        let result = ExpireSnapshots::new(table.clone())
+            .retain_last(1)
+            .expire_older_than_ms(i64::MAX)
+            .execute(&catalog)
+            .await
+            .unwrap();
+
+        assert_eq!(result.expired_snapshot_ids.len(), 2);
+        assert!(result.deleted_manifest_lists >= 1);
+        assert!(!result.dry_run);
+        assert!(!io.exists(&oldest_manifest_list).await.unwrap());
+
+        let reloaded = catalog.load_table(table.identifier()).await.unwrap();
+        assert_eq!(reloaded.metadata().snapshots().count(), 1);
+        assert_eq!(reloaded.metadata().current_snapshot_id(), Some(current));
+    }
+
+    #[tokio::test]
+    async fn test_dry_run_commits_and_deletes_nothing() {
+        let catalog = memory_catalog().await;
+        let table = empty_table(&catalog).await;
+        let table = append(&catalog, &table, "data/1.parquet").await;
+        let oldest = current_id(&table);
+        let table = append(&catalog, &table, "data/2.parquet").await;
+
+        let io = table.file_io().clone();
+        let oldest_manifest_list = manifest_list_path(&table, oldest);
+
+        let result = ExpireSnapshots::new(table.clone())
+            .retain_last(1)
+            .expire_older_than_ms(i64::MAX)
+            .dry_run(true)
+            .execute(&catalog)
+            .await
+            .unwrap();
+
+        assert!(result.dry_run);
+        assert_eq!(result.expired_snapshot_ids, vec![oldest]);
+        assert!(result.deleted_manifest_lists >= 1);
+
+        assert!(io.exists(&oldest_manifest_list).await.unwrap());
+        let reloaded = catalog.load_table(table.identifier()).await.unwrap();
+        assert_eq!(reloaded.metadata().snapshots().count(), 2);
     }
 }

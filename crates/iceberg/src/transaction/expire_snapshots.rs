@@ -74,8 +74,11 @@ impl ExpireSnapshotsAction {
         self
     }
 
-    /// Resolve the set of snapshot ids to expire against the current table metadata.
-    fn snapshot_ids_to_expire(&self, table: &Table) -> Result<Vec<i64>> {
+    /// Resolves the snapshot ids this action would remove from the given table.
+    ///
+    /// Exposed so maintenance operations can compute the files those snapshots leave behind
+    /// without duplicating the selection rules.
+    pub fn snapshot_ids_to_expire(&self, table: &Table) -> Result<Vec<i64>> {
         let metadata = table.metadata();
         let current_snapshot_id = metadata.current_snapshot_id();
 
