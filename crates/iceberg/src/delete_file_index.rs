@@ -27,6 +27,20 @@ use crate::runtime::Runtime;
 use crate::scan::{DeleteFileContext, FileScanTaskDeleteFile};
 use crate::spec::{DataContentType, DataFile, Struct};
 
+// Test-only seam used by `repro_lost_wakeup_when_sender_dropped_before_query` to make
+// the otherwise nanosecond-wide lost-wakeup race deterministic. When enabled, a querier
+// pauses just before awaiting the completion notification, giving the populating task time
+// to flip the state and fire `notify_waiters()`. Disabled (and zero-cost) for every other caller.
+#[cfg(test)]
+static FORCE_LOST_WAKEUP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+async fn maybe_force_lost_wakeup() {
+    if FORCE_LOST_WAKEUP.load(std::sync::atomic::Ordering::SeqCst) {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
 /// Index of delete files
 #[derive(Debug, Clone)]
 pub(crate) struct DeleteFileIndex {
@@ -86,17 +100,30 @@ impl DeleteFileIndex {
         data_file: &DataFile,
         seq_num: Option<i64>,
     ) -> Vec<FileScanTaskDeleteFile> {
-        let notifier = {
+        // Create the `Notified` future while still holding the read lock. Its
+        // notify_waiters snapshot is taken at creation, and the populating task
+        // cannot call `notify_waiters()` until it acquires the write lock (which is
+        // blocked while we hold the read lock). Any `notify_waiters()` therefore
+        // happens after this future is created and is guaranteed to be delivered,
+        // closing a lost-wakeup window in which a query could hang forever.
+        // `notified_owned` lets the future own its `Arc` so it can outlive the guard.
+        let notified = {
             let guard = self.state.read().unwrap();
-            match *guard {
-                DeleteFileIndexState::Populating(ref notifier) => notifier.clone(),
-                DeleteFileIndexState::Populated(ref index) => {
+            match &*guard {
+                DeleteFileIndexState::Populating(notifier) => notifier.clone().notified_owned(),
+                DeleteFileIndexState::Populated(index) => {
                     return index.get_deletes_for_data_file(data_file, seq_num);
                 }
             }
         };
 
-        notifier.notified().await;
+        // Test seam: see `repro_lost_wakeup_when_sender_dropped_before_query`. With the
+        // future already created above, a `notify_waiters()` during this pause is still
+        // delivered; on the unfixed code (future created after this point) it would be lost.
+        #[cfg(test)]
+        maybe_force_lost_wakeup().await;
+
+        notified.await;
 
         let guard = self.state.read().unwrap();
         match guard.deref() {
@@ -220,6 +247,49 @@ mod tests {
         DataContentType, DataFileBuilder, DataFileFormat, Literal, ManifestEntry, ManifestStatus,
         Struct,
     };
+    use crate::test_utils::test_runtime;
+
+    // Reproduces a lost-wakeup hang in `get_deletes_for_data_file`.
+    //
+    // The populating task signals completion with `Notify::notify_waiters()`, which stores
+    // no permit and only wakes `Notified` futures created *before* the call. If the consumer
+    // creates its `Notified` after the populator has flipped the state and fired
+    // `notify_waiters()`, the wakeup is lost and the query awaits forever. Dropping the channel
+    // sender immediately before querying (e.g. the `SnapshotValidator` commit path in #2590)
+    // makes the populator finish right as the query starts.
+    //
+    // The natural window is only a few instructions wide, so a plain stress loop almost never
+    // lands in it. `FORCE_LOST_WAKEUP` widens it deterministically by pausing the querier so
+    // the populator's `notify_waiters()` provably precedes the consumer's registration.
+    //
+    // This test FAILS (hangs -> times out) on the unfixed code and PASSES once the `Notified`
+    // future is created while holding the read lock, before the populator can signal.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn repro_lost_wakeup_when_sender_dropped_before_query() {
+        use std::sync::atomic::Ordering;
+
+        FORCE_LOST_WAKEUP.store(true, Ordering::SeqCst);
+
+        let data_file = build_unpartitioned_data_file();
+        let (index, tx) = DeleteFileIndex::new(test_runtime());
+        // Close the channel so the populator completes (and fires notify_waiters) while the
+        // querier is paused by the seam.
+        drop(tx);
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            index.get_deletes_for_data_file(&data_file, Some(0)),
+        )
+        .await;
+
+        FORCE_LOST_WAKEUP.store(false, Ordering::SeqCst);
+
+        assert!(
+            result.is_ok(),
+            "get_deletes_for_data_file hung: lost wakeup reproduced \
+             (notify_waiters() fired before the querier registered its waiter)"
+        );
+    }
 
     #[test]
     fn test_delete_file_index_unpartitioned() {
