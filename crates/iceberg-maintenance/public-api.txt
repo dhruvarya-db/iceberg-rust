@@ -1,0 +1,23 @@
+pub mod iceberg_maintenance
+pub struct iceberg_maintenance::UnreferencedFiles
+pub iceberg_maintenance::UnreferencedFiles::data_files: std::collections::hash::set::HashSet<alloc::string::String>
+pub iceberg_maintenance::UnreferencedFiles::delete_files: std::collections::hash::set::HashSet<alloc::string::String>
+pub iceberg_maintenance::UnreferencedFiles::manifest_lists: std::collections::hash::set::HashSet<alloc::string::String>
+pub iceberg_maintenance::UnreferencedFiles::manifests: std::collections::hash::set::HashSet<alloc::string::String>
+pub iceberg_maintenance::UnreferencedFiles::partition_statistics_files: std::collections::hash::set::HashSet<alloc::string::String>
+pub iceberg_maintenance::UnreferencedFiles::statistics_files: std::collections::hash::set::HashSet<alloc::string::String>
+impl iceberg_maintenance::UnreferencedFiles
+pub fn iceberg_maintenance::UnreferencedFiles::all_paths(&self) -> impl core::iter::traits::iterator::Iterator<Item = &alloc::string::String>
+pub fn iceberg_maintenance::UnreferencedFiles::is_empty(&self) -> bool
+pub fn iceberg_maintenance::UnreferencedFiles::len(&self) -> usize
+impl core::clone::Clone for iceberg_maintenance::UnreferencedFiles
+pub fn iceberg_maintenance::UnreferencedFiles::clone(&self) -> iceberg_maintenance::UnreferencedFiles
+impl core::cmp::Eq for iceberg_maintenance::UnreferencedFiles
+impl core::cmp::PartialEq for iceberg_maintenance::UnreferencedFiles
+pub fn iceberg_maintenance::UnreferencedFiles::eq(&self, other: &iceberg_maintenance::UnreferencedFiles) -> bool
+impl core::default::Default for iceberg_maintenance::UnreferencedFiles
+pub fn iceberg_maintenance::UnreferencedFiles::default() -> iceberg_maintenance::UnreferencedFiles
+impl core::fmt::Debug for iceberg_maintenance::UnreferencedFiles
+pub fn iceberg_maintenance::UnreferencedFiles::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for iceberg_maintenance::UnreferencedFiles
+pub async fn iceberg_maintenance::unreferenced_files(table: &iceberg::table::Table, expired_snapshot_ids: &std::collections::hash::set::HashSet<i64>) -> iceberg::error::Result<iceberg_maintenance::UnreferencedFiles>
