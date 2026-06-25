@@ -3967,6 +3967,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "iceberg-maintenance"
+version = "0.10.0"
+dependencies = [
+ "futures",
+ "iceberg",
+ "tempfile",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "iceberg-playground"
 version = "0.10.0"
 dependencies = [
