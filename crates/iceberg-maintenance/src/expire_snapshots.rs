@@ -107,11 +107,12 @@ impl ExpireSnapshots {
             action = action.retain_last(retain_last);
         }
 
-        let expired_snapshot_ids = action.snapshot_ids_to_expire(&self.table)?;
-        let expired: HashSet<i64> = expired_snapshot_ids.iter().copied().collect();
-        let files = unreferenced_files(&self.table, &expired).await?;
-
+        // A dry run cannot commit, so the expiring set is only an estimate resolved against the
+        // current metadata; the real commit re-resolves it (see below).
         if self.dry_run {
+            let expired_snapshot_ids = action.snapshot_ids_to_expire(&self.table)?;
+            let expired: HashSet<i64> = expired_snapshot_ids.iter().copied().collect();
+            let files = unreferenced_files(&self.table, &expired).await?;
             return Ok(ExpireSnapshotsResult::new(
                 true,
                 expired_snapshot_ids,
@@ -119,9 +120,22 @@ impl ExpireSnapshots {
             ));
         }
 
-        let tx = action.apply(tx)?;
-        tx.commit(catalog).await?;
+        // Derive the expired set from what the commit actually removed, not from a separately
+        // recomputed plan: the action re-resolves expiry against the catalog-refreshed table and a
+        // fresh `now` at commit time (and may retry), so a pre-commit estimate can disagree with
+        // the committed metadata. Diffing snapshots before/after keeps deletion in lockstep with it.
+        let snapshots_before = snapshot_ids(&self.table);
+        let committed = action.apply(tx)?.commit(catalog).await?;
+        let mut expired_snapshot_ids: Vec<i64> = snapshots_before
+            .difference(&snapshot_ids(&committed))
+            .copied()
+            .collect();
+        expired_snapshot_ids.sort_unstable();
 
+        // Enumerate against the pre-expiry image: its manifests still exist on storage until we
+        // delete them here, and files still referenced by a retained snapshot are excluded.
+        let expired: HashSet<i64> = expired_snapshot_ids.iter().copied().collect();
+        let files = unreferenced_files(&self.table, &expired).await?;
         delete_files(self.table.file_io(), &files, self.max_concurrent_deletes).await?;
 
         Ok(ExpireSnapshotsResult::new(
@@ -130,6 +144,15 @@ impl ExpireSnapshots {
             &files,
         ))
     }
+}
+
+/// The set of snapshot ids present in a table's metadata.
+fn snapshot_ids(table: &Table) -> HashSet<i64> {
+    table
+        .metadata()
+        .snapshots()
+        .map(|snapshot| snapshot.snapshot_id())
+        .collect()
 }
 
 /// Outcome of an [`ExpireSnapshots`] run: the expired snapshots and the per-kind file counts that
