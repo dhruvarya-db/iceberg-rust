@@ -98,6 +98,16 @@ impl ExpireSnapshotsAction {
         self
     }
 
+    /// Returns the snapshot ids this action would expire from `table`, without committing.
+    ///
+    /// A maintenance orchestrator needs these ids up front: to compute the files reachable only
+    /// from the expiring snapshots (which must be read before the metadata is committed), and to
+    /// report a dry run. The result matches what [`commit`](TransactionAction::commit) would emit.
+    pub fn snapshot_ids_to_expire(&self, table: &Table) -> Result<Vec<i64>> {
+        let properties = table.metadata().table_properties()?;
+        Ok(self.plan(table, &properties)?.ids_to_remove)
+    }
+
     /// Resolves the snapshots and refs to remove, following Java `RemoveSnapshots.internalApply`.
     fn plan(&self, table: &Table, properties: &TableProperties) -> Result<ExpirePlan> {
         // Matches Java `RemoveSnapshots.retainLast`, which requires at least one snapshot.

@@ -1,4 +1,30 @@
 pub mod iceberg_maintenance
+pub struct iceberg_maintenance::ExpireSnapshots
+impl iceberg_maintenance::ExpireSnapshots
+pub fn iceberg_maintenance::ExpireSnapshots::dry_run(self, dry_run: bool) -> Self
+pub async fn iceberg_maintenance::ExpireSnapshots::execute(self, catalog: &dyn iceberg::catalog::Catalog) -> iceberg::error::Result<iceberg_maintenance::ExpireSnapshotsResult>
+pub fn iceberg_maintenance::ExpireSnapshots::expire_older_than_ms(self, older_than_ms: i64) -> Self
+pub fn iceberg_maintenance::ExpireSnapshots::expire_snapshot_ids(self, snapshot_ids: impl core::iter::traits::collect::IntoIterator<Item = i64>) -> Self
+pub fn iceberg_maintenance::ExpireSnapshots::max_concurrent_deletes(self, max_concurrent_deletes: usize) -> Self
+pub fn iceberg_maintenance::ExpireSnapshots::new(table: iceberg::table::Table) -> Self
+pub fn iceberg_maintenance::ExpireSnapshots::retain_last(self, retain_last: usize) -> Self
+pub struct iceberg_maintenance::ExpireSnapshotsResult
+pub iceberg_maintenance::ExpireSnapshotsResult::data_files: usize
+pub iceberg_maintenance::ExpireSnapshotsResult::delete_files: usize
+pub iceberg_maintenance::ExpireSnapshotsResult::dry_run: bool
+pub iceberg_maintenance::ExpireSnapshotsResult::expired_snapshot_ids: alloc::vec::Vec<i64>
+pub iceberg_maintenance::ExpireSnapshotsResult::manifest_lists: usize
+pub iceberg_maintenance::ExpireSnapshotsResult::manifests: usize
+pub iceberg_maintenance::ExpireSnapshotsResult::partition_statistics_files: usize
+pub iceberg_maintenance::ExpireSnapshotsResult::statistics_files: usize
+impl core::clone::Clone for iceberg_maintenance::ExpireSnapshotsResult
+pub fn iceberg_maintenance::ExpireSnapshotsResult::clone(&self) -> iceberg_maintenance::ExpireSnapshotsResult
+impl core::cmp::Eq for iceberg_maintenance::ExpireSnapshotsResult
+impl core::cmp::PartialEq for iceberg_maintenance::ExpireSnapshotsResult
+pub fn iceberg_maintenance::ExpireSnapshotsResult::eq(&self, other: &iceberg_maintenance::ExpireSnapshotsResult) -> bool
+impl core::fmt::Debug for iceberg_maintenance::ExpireSnapshotsResult
+pub fn iceberg_maintenance::ExpireSnapshotsResult::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for iceberg_maintenance::ExpireSnapshotsResult
 pub struct iceberg_maintenance::UnreferencedFiles
 pub iceberg_maintenance::UnreferencedFiles::data_files: std::collections::hash::set::HashSet<alloc::string::String>
 pub iceberg_maintenance::UnreferencedFiles::delete_files: std::collections::hash::set::HashSet<alloc::string::String>
