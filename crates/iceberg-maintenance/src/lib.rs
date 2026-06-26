@@ -15,14 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Pure-Rust, engine-agnostic table-maintenance building blocks for Apache Iceberg.
+//! Pure-Rust, engine-agnostic table-maintenance operations for Apache Iceberg
+//! (see issue [#2145](https://github.com/apache/iceberg-rust/issues/2145)).
 //!
-//! This crate intentionally only computes *what* to delete; committing the metadata change and
-//! performing the deletion is left to a higher-level orchestrator (see issue
-//! [#2145](https://github.com/apache/iceberg-rust/issues/2145)).
+//! [`unreferenced_files`] computes which files a set of expiring snapshots would leave behind, and
+//! [`ExpireSnapshots`] is the orchestrator that expires snapshots and deletes those files.
+
+mod expire_snapshots;
 
 use std::collections::HashSet;
 
+pub use expire_snapshots::{ExpireSnapshots, ExpireSnapshotsResult};
 use futures::StreamExt;
 use iceberg::Result;
 use iceberg::spec::{DataContentType, Manifest, SnapshotRef, TableMetadata};
