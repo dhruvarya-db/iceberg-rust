@@ -96,6 +96,32 @@ impl core::fmt::Debug for iceberg_datafusion::table_provider_factory::IcebergTab
 pub fn iceberg_datafusion::table_provider_factory::IcebergTableProviderFactory::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl datafusion_catalog::table::TableProviderFactory for iceberg_datafusion::table_provider_factory::IcebergTableProviderFactory
 pub fn iceberg_datafusion::table_provider_factory::IcebergTableProviderFactory::create<'life0, 'life1, 'life2, 'async_trait>(&'life0 self, _state: &'life1 dyn datafusion_session::session::Session, cmd: &'life2 datafusion_expr::logical_plan::ddl::CreateExternalTable) -> core::pin::Pin<alloc::boxed::Box<(dyn core::future::future::Future<Output = datafusion_common::error::Result<alloc::sync::Arc<dyn datafusion_catalog::table::TableProvider>>> + core::marker::Send + 'async_trait)>> where Self: 'async_trait, 'life0: 'async_trait, 'life1: 'async_trait, 'life2: 'async_trait
+pub struct iceberg_datafusion::ExpireSnapshots
+impl iceberg_datafusion::ExpireSnapshots
+pub fn iceberg_datafusion::ExpireSnapshots::dry_run(self, dry_run: bool) -> Self
+pub async fn iceberg_datafusion::ExpireSnapshots::execute(self, catalog: &dyn iceberg::catalog::Catalog) -> iceberg::error::Result<iceberg_datafusion::ExpireSnapshotsResult>
+pub fn iceberg_datafusion::ExpireSnapshots::expire_older_than_ms(self, older_than_ms: i64) -> Self
+pub fn iceberg_datafusion::ExpireSnapshots::expire_snapshot_ids(self, snapshot_ids: impl core::iter::traits::collect::IntoIterator<Item = i64>) -> Self
+pub fn iceberg_datafusion::ExpireSnapshots::max_concurrent_deletes(self, max_concurrent_deletes: usize) -> Self
+pub fn iceberg_datafusion::ExpireSnapshots::new(table: iceberg::table::Table) -> Self
+pub fn iceberg_datafusion::ExpireSnapshots::retain_last(self, retain_last: usize) -> Self
+pub struct iceberg_datafusion::ExpireSnapshotsResult
+pub iceberg_datafusion::ExpireSnapshotsResult::data_files: usize
+pub iceberg_datafusion::ExpireSnapshotsResult::delete_files: usize
+pub iceberg_datafusion::ExpireSnapshotsResult::dry_run: bool
+pub iceberg_datafusion::ExpireSnapshotsResult::expired_snapshot_ids: alloc::vec::Vec<i64>
+pub iceberg_datafusion::ExpireSnapshotsResult::manifest_lists: usize
+pub iceberg_datafusion::ExpireSnapshotsResult::manifests: usize
+pub iceberg_datafusion::ExpireSnapshotsResult::partition_statistics_files: usize
+pub iceberg_datafusion::ExpireSnapshotsResult::statistics_files: usize
+impl core::clone::Clone for iceberg_datafusion::ExpireSnapshotsResult
+pub fn iceberg_datafusion::ExpireSnapshotsResult::clone(&self) -> iceberg_datafusion::ExpireSnapshotsResult
+impl core::cmp::Eq for iceberg_datafusion::ExpireSnapshotsResult
+impl core::cmp::PartialEq for iceberg_datafusion::ExpireSnapshotsResult
+pub fn iceberg_datafusion::ExpireSnapshotsResult::eq(&self, other: &iceberg_datafusion::ExpireSnapshotsResult) -> bool
+impl core::fmt::Debug for iceberg_datafusion::ExpireSnapshotsResult
+pub fn iceberg_datafusion::ExpireSnapshotsResult::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::StructuralPartialEq for iceberg_datafusion::ExpireSnapshotsResult
 pub struct iceberg_datafusion::IcebergCatalogProvider
 impl iceberg_datafusion::IcebergCatalogProvider
 pub async fn iceberg_datafusion::IcebergCatalogProvider::try_new(client: alloc::sync::Arc<dyn iceberg::catalog::Catalog>) -> iceberg::error::Result<Self>
