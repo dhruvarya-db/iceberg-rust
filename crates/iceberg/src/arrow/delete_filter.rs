@@ -29,6 +29,24 @@ use crate::scan::{FileScanTask, FileScanTaskDeleteFile};
 use crate::spec::DataContentType;
 use crate::{Error, ErrorKind, Result};
 
+// Test-only seam for `test_get_equality_delete_predicate_survives_notify_before_register`. When
+// enabled, the consumer pauses after observing the `Loading` state but before awaiting the
+// notifier, so the test can flip the state to `Loaded` and fire `notify_waiters()` first. Because
+// the fix creates the `Notified` under the read lock, the notification is still delivered. Inert
+// unless enabled.
+#[cfg(test)]
+pub(crate) mod test_seam {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    pub(crate) static ENABLED: AtomicBool = AtomicBool::new(false);
+    pub(crate) const PAUSE: Duration = Duration::from_millis(500);
+
+    pub(crate) fn is_enabled() -> bool {
+        ENABLED.load(Ordering::SeqCst)
+    }
+}
+
 #[derive(Debug)]
 enum EqDelState {
     Loading(Arc<Notify>),
@@ -163,17 +181,29 @@ impl DeleteFilter {
         &self,
         file_path: &str,
     ) -> Option<Predicate> {
-        let notifier = {
+        // Create the `Notified` while holding the read lock. The read lock ensures that
+        // when we go inside it, either the state is already at Loaded or it is still at
+        // Loading AND `notify_waiters()` has not been called yet. Any `Notified` created
+        // before the invocation of `notify_waiters()` will be notified by it even if
+        // `await` has not been called on it yet.
+        let notified = {
             match self.state.read().unwrap().equality_deletes.get(file_path) {
                 None => return None,
-                Some(EqDelState::Loading(notifier)) => notifier.clone(),
+                Some(EqDelState::Loading(notifier)) => notifier.clone().notified_owned(),
                 Some(EqDelState::Loaded(predicate)) => {
                     return Some(predicate.clone());
                 }
             }
         };
 
-        notifier.notified().await;
+        // Test seam: pause here (after creating `notified` under the lock, before awaiting) so
+        // the test can fire notify_waiters() during the pause. The fix guarantees delivery.
+        #[cfg(test)]
+        if test_seam::is_enabled() {
+            tokio::time::sleep(test_seam::PAUSE).await;
+        }
+
+        notified.await;
 
         match self.state.read().unwrap().equality_deletes.get(file_path) {
             Some(EqDelState::Loaded(predicate)) => Some(predicate.clone()),
@@ -295,6 +325,61 @@ pub(crate) mod tests {
 
     const FIELD_ID_POSITIONAL_DELETE_FILE_PATH: u64 = 2147483546;
     const FIELD_ID_POSITIONAL_DELETE_POS: u64 = 2147483545;
+
+    // Regression test for the equality-delete lost-wakeup hang. Drives the real
+    // `get_equality_delete_predicate_for_delete_file_path` through the losing interleaving: the
+    // producer transitions the state to `Loaded` and fires `notify_waiters()` while the consumer
+    // is paused (via `test_seam`) between observing `Loading` and awaiting the notifier.
+    // `notify_waiters()` stores no permit, so this only completes if the consumer's `Notified`
+    // was created before the signal — which the fix guarantees by creating it under the read
+    // lock. Hangs (5s timeout) on the pre-fix code; passes here.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_get_equality_delete_predicate_survives_notify_before_register() {
+        use std::sync::atomic::Ordering;
+
+        let filter = DeleteFilter::new(Runtime::current());
+        let path = "s3://bucket/eq-delete.parquet";
+
+        let notify = Arc::new(Notify::new());
+        filter
+            .state
+            .write()
+            .unwrap()
+            .equality_deletes
+            .insert(path.to_string(), EqDelState::Loading(notify.clone()));
+
+        test_seam::ENABLED.store(true, Ordering::SeqCst);
+
+        let consumer = tokio::spawn({
+            let filter = filter.clone();
+            async move {
+                filter
+                    .get_equality_delete_predicate_for_delete_file_path(path)
+                    .await
+            }
+        });
+
+        // Let the consumer create its `Notified` under the lock and enter the seam pause.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Producer fires while the consumer is paused; the fix ensures the notification lands.
+        filter
+            .state
+            .write()
+            .unwrap()
+            .equality_deletes
+            .insert(path.to_string(), EqDelState::Loaded(AlwaysTrue));
+        notify.notify_waiters();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), consumer).await;
+        test_seam::ENABLED.store(false, Ordering::SeqCst);
+
+        assert!(
+            result.is_ok(),
+            "get_equality_delete_predicate_for_delete_file_path must resolve after notify_waiters()"
+        );
+        assert_eq!(result.unwrap().unwrap(), Some(AlwaysTrue));
+    }
 
     #[tokio::test]
     async fn test_delete_file_filter_load_deletes() {
