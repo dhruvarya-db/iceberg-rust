@@ -296,6 +296,51 @@ pub(crate) mod tests {
     const FIELD_ID_POSITIONAL_DELETE_FILE_PATH: u64 = 2147483546;
     const FIELD_ID_POSITIONAL_DELETE_POS: u64 = 2147483545;
 
+    // Reproduces the lost-wakeup hang on the positional-delete wait path.
+    //
+    // `PosDelLoadAction::WaitFor` hands the waiter a raw `Arc<Notify>`; the waiter turns it
+    // into a `Notified` only later, when it calls `.notified().await` (see
+    // `caching_delete_file_loader::load_file_for_task`). The loader signals completion with
+    // `finish_pos_del_load`, which calls `Notify::notify_waiters()` — that stores no permit and
+    // only wakes `Notified` futures that already exist.
+    //
+    // This test drives the real `DeleteFilter` API through the losing interleaving: the loader
+    // finishes (firing `notify_waiters()`) *before* the waiter creates its `Notified`. No test
+    // seam is needed — the bug is reachable purely through the public method sequence.
+    //
+    // FAILS (hangs -> 5s timeout) on the current code. Passes once `WaitFor` carries a
+    // `Notified` created under the lock (see the companion fix PR).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn repro_lost_wakeup_when_load_finishes_before_waiter_registers() {
+        let filter = DeleteFilter::new(Runtime::current());
+        let path = "s3://bucket/pos-delete.parquet";
+
+        // Loader claims the load.
+        assert!(matches!(
+            filter.try_start_pos_del_load(path),
+            PosDelLoadAction::Load
+        ));
+
+        // A second task for the same path must wait; it receives the raw notifier.
+        let PosDelLoadAction::WaitFor(notify) = filter.try_start_pos_del_load(path) else {
+            panic!("expected WaitFor for an in-progress load");
+        };
+
+        // Loader completes and fires notify_waiters() BEFORE the waiter has created its
+        // `Notified` — exactly the interleaving the scheduler can produce on the real path.
+        filter.finish_pos_del_load(path);
+
+        // The waiter only now registers. On the unfixed code the notification is already lost,
+        // so this await never completes.
+        let waited =
+            tokio::time::timeout(std::time::Duration::from_secs(5), notify.notified()).await;
+
+        assert!(
+            waited.is_ok(),
+            "waiter hung: notify_waiters() fired before the Notified was created"
+        );
+    }
+
     #[tokio::test]
     async fn test_delete_file_filter_load_deletes() {
         let tmp_dir = TempDir::new().unwrap();
