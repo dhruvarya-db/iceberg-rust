@@ -29,6 +29,23 @@ use crate::scan::{FileScanTask, FileScanTaskDeleteFile};
 use crate::spec::DataContentType;
 use crate::{Error, ErrorKind, Result};
 
+// Test-only seam for `test_repro_lost_wakeup_in_get_equality_delete_predicate`. When enabled,
+// the consumer pauses after observing the `Loading` state but before registering on the
+// notifier, so the test can flip the state to `Loaded` and fire `notify_waiters()` first — after
+// which the consumer registers too late. Inert unless enabled.
+#[cfg(test)]
+pub(crate) mod test_seam {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    pub(crate) static ENABLED: AtomicBool = AtomicBool::new(false);
+    pub(crate) const PAUSE: Duration = Duration::from_millis(500);
+
+    pub(crate) fn is_enabled() -> bool {
+        ENABLED.load(Ordering::SeqCst)
+    }
+}
+
 #[derive(Debug)]
 enum EqDelState {
     Loading(Arc<Notify>),
@@ -173,6 +190,13 @@ impl DeleteFilter {
             }
         };
 
+        // Test seam: pause here (after observing Loading, before registering on the notifier)
+        // so the test can flip the state and fire notify_waiters() first.
+        #[cfg(test)]
+        if test_seam::is_enabled() {
+            tokio::time::sleep(test_seam::PAUSE).await;
+        }
+
         notifier.notified().await;
 
         match self.state.read().unwrap().equality_deletes.get(file_path) {
@@ -295,6 +319,69 @@ pub(crate) mod tests {
 
     const FIELD_ID_POSITIONAL_DELETE_FILE_PATH: u64 = 2147483546;
     const FIELD_ID_POSITIONAL_DELETE_POS: u64 = 2147483545;
+
+    // Reproduces the equality-delete lost-wakeup hang by driving the real
+    // `get_equality_delete_predicate_for_delete_file_path` through the losing interleaving.
+    //
+    // The producer (`insert_equality_delete`) signals completion with `Notify::notify_waiters()`,
+    // which stores no permit and only wakes `Notified` futures that already exist. On the current
+    // code the consumer observes `Loading`, releases the read lock, and only then creates its
+    // `Notified` — so a `notify_waiters()` fired in that window is lost and the query hangs.
+    //
+    // The `test_seam` pauses the consumer in that window so the test can transition the state to
+    // `Loaded` and fire `notify_waiters()` first, deterministically. This test FAILS (hangs -> 5s
+    // timeout) on the current code; the companion fix (create the `Notified` under the read lock)
+    // makes it pass.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_repro_lost_wakeup_in_get_equality_delete_predicate() {
+        use std::sync::atomic::Ordering;
+
+        let filter = DeleteFilter::new(Runtime::current());
+        let path = "s3://bucket/eq-delete.parquet";
+
+        // Mark the file as loading, with a notifier the producer will fire.
+        let notify = Arc::new(Notify::new());
+        filter
+            .state
+            .write()
+            .unwrap()
+            .equality_deletes
+            .insert(path.to_string(), EqDelState::Loading(notify.clone()));
+
+        test_seam::ENABLED.store(true, Ordering::SeqCst);
+
+        // Consumer task: runs the real query, pauses in the seam before registering.
+        let consumer = tokio::spawn({
+            let filter = filter.clone();
+            async move {
+                filter
+                    .get_equality_delete_predicate_for_delete_file_path(path)
+                    .await
+            }
+        });
+
+        // Let the consumer reach the seam and start its pause (PAUSE is much longer).
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Producer completes while the consumer is paused: transition to Loaded and fire
+        // notify_waiters() with no waiter registered -> lost.
+        filter
+            .state
+            .write()
+            .unwrap()
+            .equality_deletes
+            .insert(path.to_string(), EqDelState::Loaded(AlwaysTrue));
+        notify.notify_waiters();
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), consumer).await;
+        test_seam::ENABLED.store(false, Ordering::SeqCst);
+
+        assert!(
+            result.is_ok(),
+            "get_equality_delete_predicate_for_delete_file_path hung: \
+             notify_waiters() fired before the consumer registered"
+        );
+    }
 
     #[tokio::test]
     async fn test_delete_file_filter_load_deletes() {
