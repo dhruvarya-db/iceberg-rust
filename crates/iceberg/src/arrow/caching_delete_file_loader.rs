@@ -39,6 +39,25 @@ use crate::spec::{
 };
 use crate::{Error, ErrorKind, Result};
 
+// Test-only seam for `repro_lost_wakeup_via_load_file_for_task`. When enabled, the waiting task
+// pauses after taking the `WaitFor` branch but before registering on the notifier, so the test
+// can run the loader's `finish_pos_del_load` (which fires `notify_waiters()`) first and the
+// waiter registers too late. Inert unless enabled.
+#[cfg(test)]
+pub(crate) mod test_seam {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    pub(crate) static ENABLED: AtomicBool = AtomicBool::new(false);
+
+    // Long enough that the test's `finish_pos_del_load` reliably runs while the waiter is parked.
+    pub(crate) const PAUSE: Duration = Duration::from_millis(500);
+
+    pub(crate) fn is_enabled() -> bool {
+        ENABLED.load(Ordering::SeqCst)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct CachingDeleteFileLoader {
     basic_delete_file_loader: BasicDeleteFileLoader,
@@ -245,6 +264,14 @@ impl CachingDeleteFileLoader {
                         // Positional deletes are accessed synchronously by ArrowReader.
                         // We must wait here to ensure the data is ready before returning,
                         // otherwise ArrowReader might get an empty/partial result.
+
+                        // Test seam: pause here (after taking WaitFor, before registering on the
+                        // notifier) so the test can run the loader's notify_waiters() first.
+                        #[cfg(test)]
+                        if test_seam::is_enabled() {
+                            tokio::time::sleep(test_seam::PAUSE).await;
+                        }
+
                         notify.notified().await;
                         Ok(DeleteFileContext::ExistingPosDel)
                     }
@@ -632,6 +659,67 @@ mod tests {
     use crate::arrow::delete_filter::tests::setup;
     use crate::scan::FileScanTaskDeleteFile;
     use crate::spec::{DataContentType, Schema};
+
+    // Reproduces the positional-delete lost-wakeup hang by driving the real
+    // `load_file_for_task` through the losing interleaving. The `test_seam` pauses the waiter
+    // after it takes the `WaitFor` branch but before it registers on the notifier, so the test
+    // can fire the notification first:
+    //   1. A loader task claims the load (`try_start_pos_del_load` -> Load).
+    //   2. A waiter task runs `load_file_for_task`, takes the `WaitFor` branch, and pauses in
+    //      the seam (`test_seam::PAUSE`) *before* registering on the notifier.
+    //   3. While it is paused, the test calls `finish_pos_del_load`, firing `notify_waiters()`
+    //      with no waiter registered yet -> the wakeup is lost.
+    //   4. The pause elapses; the waiter registers via `notify.notified()`, after the
+    //      notification is already gone.
+    // On the current code this hangs (the waiter never returns); trips a 5s timeout.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn repro_lost_wakeup_via_load_file_for_task() {
+        use std::sync::atomic::Ordering;
+
+        let file_io = FileIO::new_with_fs();
+        let del_filter = DeleteFilter::new(Runtime::current());
+        let basic = BasicDeleteFileLoader::new(file_io, ScanMetrics::new());
+        let schema = Arc::new(Schema::builder().build().unwrap());
+        let path = "s3://bucket/pos-delete.parquet";
+
+        // Loader task claims the load so the waiter takes the WaitFor branch.
+        assert!(matches!(
+            del_filter.try_start_pos_del_load(path),
+            PosDelLoadAction::Load
+        ));
+
+        let task = FileScanTaskDeleteFile::builder()
+            .with_file_path(path.to_string())
+            .with_file_size_in_bytes(0)
+            .with_file_type(DataContentType::PositionDeletes)
+            .with_partition_spec_id(0)
+            .build();
+
+        test_seam::ENABLED.store(true, Ordering::SeqCst);
+
+        // Waiter task: runs the real load_file_for_task, pauses in the seam.
+        let waiter = tokio::spawn({
+            let del_filter = del_filter.clone();
+            async move {
+                CachingDeleteFileLoader::load_file_for_task(&task, basic, del_filter, schema).await
+            }
+        });
+
+        // Let the waiter reach the seam and start its pause (PAUSE is much longer than this).
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        // Loader completes while the waiter is still paused: notify_waiters() fires with no
+        // waiter registered -> lost.
+        del_filter.finish_pos_del_load(path);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), waiter).await;
+        test_seam::ENABLED.store(false, Ordering::SeqCst);
+
+        assert!(
+            result.is_ok(),
+            "load_file_for_task hung: notify_waiters() fired before the waiter registered"
+        );
+    }
 
     #[tokio::test]
     async fn test_delete_file_loader_parse_equality_deletes() {
