@@ -15,12 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 
 use crate::Result;
-use crate::spec::{DataContentType, Manifest, SnapshotRef, TableMetadata};
+use crate::spec::{DataContentType, ManifestFile, SnapshotRef, TableMetadata};
 use crate::table::Table;
 
 /// Bound on concurrent manifest-list / manifest loads, matching `CatalogUtil`'s delete concurrency.
@@ -85,11 +85,9 @@ impl UnreferencedFiles {
 /// [`crate::catalog::utils::drop_table_data`] — they may be shared with other tables (e.g. via
 /// shallow clones), whereas manifests, manifest lists, and statistics files are table-private.
 ///
-/// Reachability is resolved by reading manifests, so an I/O error matters: a failure to load a
-/// **retained** snapshot's manifest list, or to read one of its manifests, aborts the whole call
-/// (deleting a file we could not prove unreferenced would be unsafe). The same failure for an
-/// **expired** snapshot is skipped, so that snapshot simply contributes nothing — at worst this
-/// under-reports files, and never returns one that a retained snapshot still holds.
+/// Reachability is resolved by reading manifests, so any I/O error aborts the whole call: a
+/// manifest list or manifest that cannot be read — for a retained or an expired snapshot alike —
+/// leaves a reachable set incomplete, and proceeding could delete a file that is still live.
 ///
 /// This only computes paths; it does not delete anything.
 pub async fn unreferenced_files(
@@ -103,8 +101,8 @@ pub async fn unreferenced_files(
         .snapshots()
         .partition(|snapshot| expired_snapshot_ids.contains(&snapshot.snapshot_id()));
 
-    let retained_reachable = collect_reachable(table, &retained, gc_enabled, OnError::Fail).await?;
-    let expired_reachable = collect_reachable(table, &expired, gc_enabled, OnError::Skip).await?;
+    let retained_reachable = collect_reachable(table, &retained, gc_enabled).await?;
+    let expired_reachable = collect_reachable(table, &expired, gc_enabled).await?;
 
     let (retained_stats, retained_partition_stats) = stats_paths(metadata, &retained);
     let (expired_stats, expired_partition_stats) = stats_paths(metadata, &expired);
@@ -125,15 +123,6 @@ pub async fn unreferenced_files(
     })
 }
 
-/// How a manifest-list / manifest load failure is handled while collecting a reachable set.
-#[derive(Clone, Copy)]
-enum OnError {
-    /// Abort: used for retained snapshots, whose files must never be mistaken for unreferenced.
-    Fail,
-    /// Skip the offending snapshot/manifest: used for expired snapshots (best-effort cleanup).
-    Skip,
-}
-
 /// File paths reachable from a set of snapshots, before any anti-join against the retained set.
 #[derive(Default)]
 struct Reachable {
@@ -147,29 +136,22 @@ async fn collect_reachable(
     table: &Table,
     snapshots: &[&SnapshotRef],
     gc_enabled: bool,
-    on_error: OnError,
 ) -> Result<Reachable> {
     let mut reachable = Reachable::default();
 
-    // Manifest lists -> manifest paths.
-    let manifest_list_loads = futures::stream::iter(snapshots.iter().copied())
+    // Load each snapshot's manifest list concurrently; any failure aborts (see the fn docs).
+    let manifest_lists = futures::stream::iter(snapshots.iter().copied())
         .map(|snapshot| async move {
             let manifest_list = table.manifest_list_reader(snapshot).load().await?;
             Ok::<_, crate::Error>((snapshot.manifest_list().to_string(), manifest_list))
         })
         .buffer_unordered(LOAD_CONCURRENCY)
-        .collect::<Vec<_>>()
-        .await;
+        .try_collect::<Vec<_>>()
+        .await?;
 
-    let mut manifest_paths: HashSet<String> = HashSet::new();
-    for load in manifest_list_loads {
-        let (location, manifest_list) = match load {
-            Ok(loaded) => loaded,
-            Err(e) => match on_error {
-                OnError::Fail => return Err(e),
-                OnError::Skip => continue,
-            },
-        };
+    // Dedup manifests by path so one shared across snapshots in this set is only read once.
+    let mut manifests_by_path: HashMap<String, ManifestFile> = HashMap::new();
+    for (location, manifest_list) in manifest_lists {
         if !location.is_empty() {
             reachable.manifest_lists.insert(location);
         }
@@ -177,30 +159,21 @@ async fn collect_reachable(
             reachable
                 .manifests
                 .insert(manifest_file.manifest_path.clone());
-            manifest_paths.insert(manifest_file.manifest_path.clone());
+            manifests_by_path.insert(manifest_file.manifest_path.clone(), manifest_file.clone());
         }
     }
 
     // Data/delete files are only relevant under gc.enabled (see the function-level docs).
     if gc_enabled {
         let io = table.file_io();
-        let manifest_reads = futures::stream::iter(manifest_paths)
-            .map(|path| async move {
-                let bytes = io.new_input(&path)?.read().await?;
-                Manifest::parse_avro(&bytes)
-            })
+        // `load_manifest` (unlike a raw read) transparently decrypts an encrypted manifest.
+        let manifests = futures::stream::iter(manifests_by_path.into_values())
+            .map(|manifest_file| async move { manifest_file.load_manifest(io).await })
             .buffer_unordered(LOAD_CONCURRENCY)
-            .collect::<Vec<_>>()
-            .await;
+            .try_collect::<Vec<_>>()
+            .await?;
 
-        for read in manifest_reads {
-            let manifest = match read {
-                Ok(manifest) => manifest,
-                Err(e) => match on_error {
-                    OnError::Fail => return Err(e),
-                    OnError::Skip => continue,
-                },
-            };
+        for manifest in manifests {
             for entry in manifest.entries() {
                 let path = entry.file_path().to_string();
                 match entry.data_file().content_type() {
@@ -242,7 +215,7 @@ fn difference(mut from: HashSet<String>, remove: &HashSet<String>) -> HashSet<St
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
 
     use tempfile::TempDir;
@@ -252,15 +225,16 @@ mod tests {
     use crate::TableIdent;
     use crate::io::FileIO;
     use crate::spec::{
-        DataContentType, DataFileBuilder, DataFileFormat, FormatVersion, ManifestFile,
-        ManifestListWriter, ManifestWriterBuilder, NestedField, Operation, PartitionSpec,
-        PrimitiveType, Schema, SchemaRef, Snapshot, SortOrder, StatisticsFile, Struct, Summary,
-        TableMetadataBuilder, Type,
+        DataFile, DataFileBuilder, DataFileFormat, FormatVersion, ManifestListWriter,
+        ManifestWriterBuilder, NestedField, Operation, PartitionSpec, PartitionStatisticsFile,
+        PrimitiveType, Schema, SchemaRef, Snapshot, SnapshotReference, SnapshotRetention,
+        SortOrder, StatisticsFile, Struct, Summary, TableMetadataBuilder, Type,
     };
-    use crate::table::Table;
 
-    const OLD: i64 = 1;
-    const CURRENT: i64 = 2;
+    // Oldest to newest; S3 is only used by the multi-snapshot test.
+    const S1: i64 = 1;
+    const S2: i64 = 2;
+    const S3: i64 = 3;
 
     fn schema() -> SchemaRef {
         Arc::new(
@@ -274,7 +248,11 @@ mod tests {
         )
     }
 
-    fn data_file(path: &str, content: DataContentType) -> crate::spec::DataFile {
+    fn unpartitioned() -> PartitionSpec {
+        PartitionSpec::unpartition_spec()
+    }
+
+    fn data_file(path: &str, content: DataContentType) -> DataFile {
         DataFileBuilder::default()
             .partition_spec_id(0)
             .content(content)
@@ -291,7 +269,7 @@ mod tests {
     /// Writes a manifest holding `files` (all of `content` kind) and returns it.
     async fn write_manifest(
         file_io: &FileIO,
-        table_location: &str,
+        loc: &str,
         snapshot_id: i64,
         sequence_number: i64,
         content: DataContentType,
@@ -299,7 +277,7 @@ mod tests {
     ) -> ManifestFile {
         let output = file_io
             .new_output(format!(
-                "{table_location}/metadata/manifest-{snapshot_id}-{}.avro",
+                "{loc}/metadata/manifest-{snapshot_id}-{}.avro",
                 Uuid::new_v4()
             ))
             .unwrap();
@@ -317,47 +295,16 @@ mod tests {
         writer.write_manifest_file().await.unwrap()
     }
 
-    /// Writes a snapshot's manifest list (referencing optional data/delete manifests) and returns its
-    /// location. The manifest-list file is only created here; callers that want a *missing* list pass
-    /// the returned location to the snapshot without calling this.
-    async fn write_manifest_list(
+    /// Writes a snapshot's manifest list from the given `manifests` and returns its location.
+    async fn write_list(
         file_io: &FileIO,
-        table_location: &str,
+        loc: &str,
         snapshot_id: i64,
         parent_snapshot_id: Option<i64>,
         sequence_number: i64,
-        data_files: &[&str],
-        delete_files: &[&str],
+        manifests: Vec<ManifestFile>,
     ) -> String {
-        let mut manifests: Vec<ManifestFile> = vec![];
-        if !data_files.is_empty() {
-            manifests.push(
-                write_manifest(
-                    file_io,
-                    table_location,
-                    snapshot_id,
-                    sequence_number,
-                    DataContentType::Data,
-                    data_files,
-                )
-                .await,
-            );
-        }
-        if !delete_files.is_empty() {
-            manifests.push(
-                write_manifest(
-                    file_io,
-                    table_location,
-                    snapshot_id,
-                    sequence_number,
-                    DataContentType::PositionDeletes,
-                    delete_files,
-                )
-                .await,
-            );
-        }
-
-        let location = format!("{table_location}/metadata/snap-{snapshot_id}.avro");
+        let location = format!("{loc}/metadata/snap-{snapshot_id}.avro");
         let output = file_io.new_output(&location).unwrap();
         let mut writer = ManifestListWriter::v2(
             output.writer().await.unwrap(),
@@ -370,8 +317,53 @@ mod tests {
         location
     }
 
-    fn unpartitioned() -> PartitionSpec {
-        PartitionSpec::unpartition_spec()
+    /// Convenience over [`write_list`]: builds one data manifest and/or one delete manifest for the
+    /// snapshot, then writes the manifest list referencing them.
+    async fn write_manifest_list(
+        file_io: &FileIO,
+        loc: &str,
+        snapshot_id: i64,
+        parent_snapshot_id: Option<i64>,
+        sequence_number: i64,
+        data_files: &[&str],
+        delete_files: &[&str],
+    ) -> String {
+        let mut manifests: Vec<ManifestFile> = vec![];
+        if !data_files.is_empty() {
+            manifests.push(
+                write_manifest(
+                    file_io,
+                    loc,
+                    snapshot_id,
+                    sequence_number,
+                    DataContentType::Data,
+                    data_files,
+                )
+                .await,
+            );
+        }
+        if !delete_files.is_empty() {
+            manifests.push(
+                write_manifest(
+                    file_io,
+                    loc,
+                    snapshot_id,
+                    sequence_number,
+                    DataContentType::PositionDeletes,
+                    delete_files,
+                )
+                .await,
+            );
+        }
+        write_list(
+            file_io,
+            loc,
+            snapshot_id,
+            parent_snapshot_id,
+            sequence_number,
+            manifests,
+        )
+        .await
     }
 
     fn snapshot(
@@ -395,14 +387,34 @@ mod tests {
             .build()
     }
 
-    /// Builds a table from pre-built (old, current) snapshots, with `current` as the main head.
-    fn table_with(
+    fn stats_file(snapshot_id: i64, path: &str) -> StatisticsFile {
+        StatisticsFile {
+            snapshot_id,
+            statistics_path: path.to_string(),
+            file_size_in_bytes: 1,
+            file_footer_size_in_bytes: 1,
+            key_metadata: None,
+            blob_metadata: vec![],
+        }
+    }
+
+    fn partition_stats_file(snapshot_id: i64, path: &str) -> PartitionStatisticsFile {
+        PartitionStatisticsFile {
+            snapshot_id,
+            statistics_path: path.to_string(),
+            file_size_in_bytes: 1,
+        }
+    }
+
+    /// Builds a table from pre-built `snapshots`, with `main_head` as the main branch head.
+    fn build_table(
         tmp: &TempDir,
         file_io: FileIO,
-        old: Snapshot,
-        current: Snapshot,
+        snapshots: Vec<Snapshot>,
+        main_head: i64,
         properties: HashMap<String, String>,
         statistics: Vec<StatisticsFile>,
+        partition_statistics: Vec<PartitionStatisticsFile>,
     ) -> Table {
         let location = tmp.path().join("table").to_str().unwrap().to_string();
         let mut builder = TableMetadataBuilder::new(
@@ -413,22 +425,25 @@ mod tests {
             FormatVersion::V2,
             properties,
         )
-        .unwrap()
-        .add_snapshot(old)
-        .unwrap()
-        .add_snapshot(current.clone())
-        .unwrap()
-        .set_ref("main", crate::spec::SnapshotReference {
-            snapshot_id: current.snapshot_id(),
-            retention: crate::spec::SnapshotRetention::Branch {
-                min_snapshots_to_keep: None,
-                max_snapshot_age_ms: None,
-                max_ref_age_ms: None,
-            },
-        })
         .unwrap();
+        for snap in snapshots {
+            builder = builder.add_snapshot(snap).unwrap();
+        }
+        builder = builder
+            .set_ref("main", SnapshotReference {
+                snapshot_id: main_head,
+                retention: SnapshotRetention::Branch {
+                    min_snapshots_to_keep: None,
+                    max_snapshot_age_ms: None,
+                    max_ref_age_ms: None,
+                },
+            })
+            .unwrap();
         for stats in statistics {
             builder = builder.set_statistics(stats);
+        }
+        for partition_stats in partition_statistics {
+            builder = builder.set_partition_statistics(partition_stats);
         }
         let metadata = builder.build().unwrap().metadata;
 
@@ -448,65 +463,55 @@ mod tests {
             .unwrap()
     }
 
-    fn stats_file(snapshot_id: i64, path: &str) -> StatisticsFile {
-        StatisticsFile {
-            snapshot_id,
-            statistics_path: path.to_string(),
-            file_size_in_bytes: 1,
-            file_footer_size_in_bytes: 1,
-            key_metadata: None,
-            blob_metadata: vec![],
-        }
-    }
-
     #[tokio::test]
     async fn returns_only_files_reachable_solely_from_expired_snapshot() {
         let tmp = TempDir::new().unwrap();
         let file_io = FileIO::new_with_fs();
         let loc = tmp.path().join("table").to_str().unwrap().to_string();
 
-        // OLD shares `shared.parquet` with CURRENT; each also has a private data file.
-        let old_list = write_manifest_list(
+        // S1 shares `shared.parquet` with S2; each also has a private data file.
+        let s1_list = write_manifest_list(
             &file_io,
             &loc,
-            OLD,
+            S1,
             None,
             1,
-            &["/shared.parquet", "/old.parquet"],
+            &["/shared.parquet", "/s1.parquet"],
             &[],
         )
         .await;
-        let cur_list = write_manifest_list(
+        let s2_list = write_manifest_list(
             &file_io,
             &loc,
-            CURRENT,
-            Some(OLD),
+            S2,
+            Some(S1),
             2,
-            &["/shared.parquet", "/cur.parquet"],
+            &["/shared.parquet", "/s2.parquet"],
             &[],
         )
         .await;
 
-        let table = table_with(
+        let table = build_table(
             &tmp,
             file_io,
-            snapshot(OLD, None, 1, 1000, old_list.clone()),
-            snapshot(CURRENT, Some(OLD), 2, 2000, cur_list),
+            vec![
+                snapshot(S1, None, 1, 1000, s1_list.clone()),
+                snapshot(S2, Some(S1), 2, 2000, s2_list),
+            ],
+            S2,
             HashMap::new(),
+            vec![],
             vec![],
         );
 
-        let files = unreferenced_files(&table, &HashSet::from([OLD]))
+        let files = unreferenced_files(&table, &HashSet::from([S1]))
             .await
             .unwrap();
 
-        assert_eq!(files.manifest_lists, HashSet::from([old_list]));
-        assert_eq!(
-            files.data_files,
-            HashSet::from(["/old.parquet".to_string()])
-        );
+        assert_eq!(files.manifest_lists, HashSet::from([s1_list]));
+        assert_eq!(files.data_files, HashSet::from(["/s1.parquet".to_string()]));
         assert!(files.delete_files.is_empty());
-        // OLD has exactly one (data) manifest, distinct from CURRENT's.
+        // S1 has exactly one (data) manifest, distinct from S2's.
         assert_eq!(files.manifests.len(), 1);
     }
 
@@ -516,34 +521,72 @@ mod tests {
         let file_io = FileIO::new_with_fs();
         let loc = tmp.path().join("table").to_str().unwrap().to_string();
 
-        let old_list = write_manifest_list(&file_io, &loc, OLD, None, 1, &["/old.parquet"], &[
-            "/old-delete.parquet",
+        let s1_list = write_manifest_list(&file_io, &loc, S1, None, 1, &["/s1.parquet"], &[
+            "/s1-delete.parquet",
         ])
         .await;
-        let cur_list =
-            write_manifest_list(&file_io, &loc, CURRENT, Some(OLD), 2, &["/cur.parquet"], &[
-            ])
-            .await;
+        let s2_list =
+            write_manifest_list(&file_io, &loc, S2, Some(S1), 2, &["/s2.parquet"], &[]).await;
 
-        let table = table_with(
+        let table = build_table(
             &tmp,
             file_io,
-            snapshot(OLD, None, 1, 1000, old_list),
-            snapshot(CURRENT, Some(OLD), 2, 2000, cur_list),
+            vec![
+                snapshot(S1, None, 1, 1000, s1_list),
+                snapshot(S2, Some(S1), 2, 2000, s2_list),
+            ],
+            S2,
             HashMap::new(),
+            vec![],
             vec![],
         );
 
-        let files = unreferenced_files(&table, &HashSet::from([OLD]))
+        let files = unreferenced_files(&table, &HashSet::from([S1]))
+            .await
+            .unwrap();
+        assert_eq!(files.data_files, HashSet::from(["/s1.parquet".to_string()]));
+        assert_eq!(
+            files.delete_files,
+            HashSet::from(["/s1-delete.parquet".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_delete_file_is_excluded() {
+        let tmp = TempDir::new().unwrap();
+        let file_io = FileIO::new_with_fs();
+        let loc = tmp.path().join("table").to_str().unwrap().to_string();
+
+        // Both snapshots reference `/shared-delete.parquet`; only S1 also has a private delete file.
+        let s1_list = write_manifest_list(&file_io, &loc, S1, None, 1, &["/s1.parquet"], &[
+            "/shared-delete.parquet",
+            "/s1-delete.parquet",
+        ])
+        .await;
+        let s2_list = write_manifest_list(&file_io, &loc, S2, Some(S1), 2, &["/s2.parquet"], &[
+            "/shared-delete.parquet",
+        ])
+        .await;
+
+        let table = build_table(
+            &tmp,
+            file_io,
+            vec![
+                snapshot(S1, None, 1, 1000, s1_list),
+                snapshot(S2, Some(S1), 2, 2000, s2_list),
+            ],
+            S2,
+            HashMap::new(),
+            vec![],
+            vec![],
+        );
+
+        let files = unreferenced_files(&table, &HashSet::from([S1]))
             .await
             .unwrap();
         assert_eq!(
-            files.data_files,
-            HashSet::from(["/old.parquet".to_string()])
-        );
-        assert_eq!(
             files.delete_files,
-            HashSet::from(["/old-delete.parquet".to_string()])
+            HashSet::from(["/s1-delete.parquet".to_string()])
         );
     }
 
@@ -553,33 +596,70 @@ mod tests {
         let file_io = FileIO::new_with_fs();
         let loc = tmp.path().join("table").to_str().unwrap().to_string();
 
-        let old_list =
-            write_manifest_list(&file_io, &loc, OLD, None, 1, &["/old.parquet"], &[]).await;
-        let cur_list =
-            write_manifest_list(&file_io, &loc, CURRENT, Some(OLD), 2, &["/cur.parquet"], &[
-            ])
-            .await;
+        let s1_list = write_manifest_list(&file_io, &loc, S1, None, 1, &["/s1.parquet"], &[]).await;
+        let s2_list =
+            write_manifest_list(&file_io, &loc, S2, Some(S1), 2, &["/s2.parquet"], &[]).await;
 
-        let table = table_with(
+        let table = build_table(
             &tmp,
             file_io,
-            snapshot(OLD, None, 1, 1000, old_list),
-            snapshot(CURRENT, Some(OLD), 2, 2000, cur_list),
+            vec![
+                snapshot(S1, None, 1, 1000, s1_list),
+                snapshot(S2, Some(S1), 2, 2000, s2_list),
+            ],
+            S2,
             HashMap::new(),
             vec![
-                stats_file(OLD, "/old-stats.puffin"),
-                stats_file(CURRENT, "/cur-stats.puffin"),
+                stats_file(S1, "/s1-stats.puffin"),
+                stats_file(S2, "/s2-stats.puffin"),
             ],
+            vec![],
         );
 
-        let files = unreferenced_files(&table, &HashSet::from([OLD]))
+        let files = unreferenced_files(&table, &HashSet::from([S1]))
             .await
             .unwrap();
         // Only the expired snapshot's statistics file is returned; the retained one is kept.
         assert_eq!(
             files.statistics_files,
-            HashSet::from(["/old-stats.puffin".to_string()])
+            HashSet::from(["/s1-stats.puffin".to_string()])
         );
+    }
+
+    #[tokio::test]
+    async fn returns_partition_statistics_files_of_expired_snapshot() {
+        let tmp = TempDir::new().unwrap();
+        let file_io = FileIO::new_with_fs();
+        let loc = tmp.path().join("table").to_str().unwrap().to_string();
+
+        let s1_list = write_manifest_list(&file_io, &loc, S1, None, 1, &["/s1.parquet"], &[]).await;
+        let s2_list =
+            write_manifest_list(&file_io, &loc, S2, Some(S1), 2, &["/s2.parquet"], &[]).await;
+
+        let table = build_table(
+            &tmp,
+            file_io,
+            vec![
+                snapshot(S1, None, 1, 1000, s1_list),
+                snapshot(S2, Some(S1), 2, 2000, s2_list),
+            ],
+            S2,
+            HashMap::new(),
+            vec![],
+            vec![
+                partition_stats_file(S1, "/s1-pstats.puffin"),
+                partition_stats_file(S2, "/s2-pstats.puffin"),
+            ],
+        );
+
+        let files = unreferenced_files(&table, &HashSet::from([S1]))
+            .await
+            .unwrap();
+        assert_eq!(
+            files.partition_statistics_files,
+            HashSet::from(["/s1-pstats.puffin".to_string()])
+        );
+        assert!(files.statistics_files.is_empty());
     }
 
     #[tokio::test]
@@ -588,84 +668,246 @@ mod tests {
         let file_io = FileIO::new_with_fs();
         let loc = tmp.path().join("table").to_str().unwrap().to_string();
 
-        let old_list =
-            write_manifest_list(&file_io, &loc, OLD, None, 1, &["/old.parquet"], &[]).await;
-        let cur_list =
-            write_manifest_list(&file_io, &loc, CURRENT, Some(OLD), 2, &["/cur.parquet"], &[
-            ])
-            .await;
+        let s1_list = write_manifest_list(&file_io, &loc, S1, None, 1, &["/s1.parquet"], &[]).await;
+        let s2_list =
+            write_manifest_list(&file_io, &loc, S2, Some(S1), 2, &["/s2.parquet"], &[]).await;
 
-        let table = table_with(
+        let table = build_table(
             &tmp,
             file_io,
-            snapshot(OLD, None, 1, 1000, old_list.clone()),
-            snapshot(CURRENT, Some(OLD), 2, 2000, cur_list),
+            vec![
+                snapshot(S1, None, 1, 1000, s1_list.clone()),
+                snapshot(S2, Some(S1), 2, 2000, s2_list),
+            ],
+            S2,
             HashMap::from([("gc.enabled".to_string(), "false".to_string())]),
+            vec![],
             vec![],
         );
 
-        let files = unreferenced_files(&table, &HashSet::from([OLD]))
+        let files = unreferenced_files(&table, &HashSet::from([S1]))
             .await
             .unwrap();
         // Data files are not collected with gc disabled, but the table-private metadata still is.
         assert!(files.data_files.is_empty());
-        assert_eq!(files.manifest_lists, HashSet::from([old_list]));
+        assert_eq!(files.manifest_lists, HashSet::from([s1_list]));
         assert_eq!(files.manifests.len(), 1);
     }
 
     #[tokio::test]
-    async fn retained_snapshot_load_error_fails() {
+    async fn shared_manifest_carried_forward_is_excluded() {
         let tmp = TempDir::new().unwrap();
         let file_io = FileIO::new_with_fs();
         let loc = tmp.path().join("table").to_str().unwrap().to_string();
 
-        // CURRENT (retained) points at a manifest list that was never written.
-        let old_list =
-            write_manifest_list(&file_io, &loc, OLD, None, 1, &["/old.parquet"], &[]).await;
-        let missing = format!("{loc}/metadata/snap-missing.avro");
+        // A single manifest is carried forward from S1 into S2; each snapshot also has a private one.
+        let shared = write_manifest(&file_io, &loc, S1, 1, DataContentType::Data, &[
+            "/shared.parquet",
+        ])
+        .await;
+        let s1_only = write_manifest(&file_io, &loc, S1, 1, DataContentType::Data, &[
+            "/s1.parquet",
+        ])
+        .await;
+        let s2_only = write_manifest(&file_io, &loc, S2, 2, DataContentType::Data, &[
+            "/s2.parquet",
+        ])
+        .await;
+        let s1_list = write_list(&file_io, &loc, S1, None, 1, vec![
+            shared.clone(),
+            s1_only.clone(),
+        ])
+        .await;
+        // A carried-forward manifest keeps the sequence number it was first committed with, as a
+        // real fast-append would when reading it back from S1's manifest list.
+        let mut shared_in_s2 = shared.clone();
+        shared_in_s2.sequence_number = 1;
+        shared_in_s2.min_sequence_number = 1;
+        let s2_list =
+            write_list(&file_io, &loc, S2, Some(S1), 2, vec![shared_in_s2, s2_only]).await;
 
-        let table = table_with(
+        let table = build_table(
             &tmp,
             file_io,
-            snapshot(OLD, None, 1, 1000, old_list),
-            snapshot(CURRENT, Some(OLD), 2, 2000, missing),
+            vec![
+                snapshot(S1, None, 1, 1000, s1_list.clone()),
+                snapshot(S2, Some(S1), 2, 2000, s2_list),
+            ],
+            S2,
             HashMap::new(),
+            vec![],
+            vec![],
+        );
+
+        let files = unreferenced_files(&table, &HashSet::from([S1]))
+            .await
+            .unwrap();
+        // S1's manifest list is orphaned; the carried-forward manifest is kept (still in S2), while
+        // S1's private manifest is not.
+        assert_eq!(files.manifest_lists, HashSet::from([s1_list]));
+        assert!(files.manifests.contains(&s1_only.manifest_path));
+        assert!(!files.manifests.contains(&shared.manifest_path));
+        assert_eq!(files.manifests.len(), 1);
+        // The shared data file is kept; only S1's private data file is unreferenced.
+        assert_eq!(files.data_files, HashSet::from(["/s1.parquet".to_string()]));
+    }
+
+    #[tokio::test]
+    async fn expires_multiple_snapshots() {
+        let tmp = TempDir::new().unwrap();
+        let file_io = FileIO::new_with_fs();
+        let loc = tmp.path().join("table").to_str().unwrap().to_string();
+
+        let l1 = write_manifest_list(&file_io, &loc, S1, None, 1, &["/f1.parquet"], &[]).await;
+        let l2 = write_manifest_list(&file_io, &loc, S2, Some(S1), 2, &["/f2.parquet"], &[]).await;
+        let l3 = write_manifest_list(&file_io, &loc, S3, Some(S2), 3, &["/f3.parquet"], &[]).await;
+
+        let table = build_table(
+            &tmp,
+            file_io,
+            vec![
+                snapshot(S1, None, 1, 1000, l1.clone()),
+                snapshot(S2, Some(S1), 2, 2000, l2.clone()),
+                snapshot(S3, Some(S2), 3, 3000, l3),
+            ],
+            S3,
+            HashMap::new(),
+            vec![],
+            vec![],
+        );
+
+        let files = unreferenced_files(&table, &HashSet::from([S1, S2]))
+            .await
+            .unwrap();
+        assert_eq!(files.manifest_lists, HashSet::from([l1, l2]));
+        assert_eq!(
+            files.data_files,
+            HashSet::from(["/f1.parquet".to_string(), "/f2.parquet".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_expired_set_returns_nothing() {
+        let tmp = TempDir::new().unwrap();
+        let file_io = FileIO::new_with_fs();
+        let loc = tmp.path().join("table").to_str().unwrap().to_string();
+
+        let s1_list = write_manifest_list(&file_io, &loc, S1, None, 1, &["/s1.parquet"], &[]).await;
+        let s2_list =
+            write_manifest_list(&file_io, &loc, S2, Some(S1), 2, &["/s2.parquet"], &[]).await;
+
+        let table = build_table(
+            &tmp,
+            file_io,
+            vec![
+                snapshot(S1, None, 1, 1000, s1_list),
+                snapshot(S2, Some(S1), 2, 2000, s2_list),
+            ],
+            S2,
+            HashMap::new(),
+            vec![],
+            vec![],
+        );
+
+        let files = unreferenced_files(&table, &HashSet::new()).await.unwrap();
+        assert!(files.is_empty());
+    }
+
+    #[tokio::test]
+    async fn retained_snapshot_manifest_list_load_error_fails() {
+        let tmp = TempDir::new().unwrap();
+        let file_io = FileIO::new_with_fs();
+        let loc = tmp.path().join("table").to_str().unwrap().to_string();
+
+        // S2 (retained) points at a manifest list that was never written.
+        let s1_list = write_manifest_list(&file_io, &loc, S1, None, 1, &["/s1.parquet"], &[]).await;
+        let missing = format!("{loc}/metadata/snap-missing.avro");
+
+        let table = build_table(
+            &tmp,
+            file_io,
+            vec![
+                snapshot(S1, None, 1, 1000, s1_list),
+                snapshot(S2, Some(S1), 2, 2000, missing),
+            ],
+            S2,
+            HashMap::new(),
+            vec![],
             vec![],
         );
 
         assert!(
-            unreferenced_files(&table, &HashSet::from([OLD]))
+            unreferenced_files(&table, &HashSet::from([S1]))
                 .await
                 .is_err()
         );
     }
 
     #[tokio::test]
-    async fn expired_snapshot_load_error_is_skipped() {
+    async fn retained_snapshot_manifest_read_error_fails() {
         let tmp = TempDir::new().unwrap();
         let file_io = FileIO::new_with_fs();
         let loc = tmp.path().join("table").to_str().unwrap().to_string();
 
-        // OLD (expired) points at a manifest list that was never written; CURRENT is intact.
-        let missing = format!("{loc}/metadata/snap-missing.avro");
-        let cur_list =
-            write_manifest_list(&file_io, &loc, CURRENT, Some(OLD), 2, &["/cur.parquet"], &[
-            ])
-            .await;
+        // S2 (retained): its manifest list loads, but the manifest it references is removed from
+        // storage, so reading manifest contents under gc.enabled fails.
+        let s2_manifest = write_manifest(&file_io, &loc, S2, 2, DataContentType::Data, &[
+            "/s2.parquet",
+        ])
+        .await;
+        let s2_list = write_list(&file_io, &loc, S2, Some(S1), 2, vec![s2_manifest.clone()]).await;
+        let s1_list = write_manifest_list(&file_io, &loc, S1, None, 1, &["/s1.parquet"], &[]).await;
+        std::fs::remove_file(&s2_manifest.manifest_path).unwrap();
 
-        let table = table_with(
+        let table = build_table(
             &tmp,
             file_io,
-            snapshot(OLD, None, 1, 1000, missing),
-            snapshot(CURRENT, Some(OLD), 2, 2000, cur_list),
+            vec![
+                snapshot(S1, None, 1, 1000, s1_list),
+                snapshot(S2, Some(S1), 2, 2000, s2_list),
+            ],
+            S2,
             HashMap::new(),
+            vec![],
             vec![],
         );
 
-        // The unreadable expired snapshot is skipped, so nothing is reported for deletion.
-        let files = unreferenced_files(&table, &HashSet::from([OLD]))
-            .await
-            .unwrap();
-        assert!(files.is_empty());
+        assert!(
+            unreferenced_files(&table, &HashSet::from([S1]))
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn expired_snapshot_load_error_fails() {
+        let tmp = TempDir::new().unwrap();
+        let file_io = FileIO::new_with_fs();
+        let loc = tmp.path().join("table").to_str().unwrap().to_string();
+
+        // S1 (expired) points at a manifest list that was never written; S2 is intact.
+        let missing = format!("{loc}/metadata/snap-missing.avro");
+        let s2_list =
+            write_manifest_list(&file_io, &loc, S2, Some(S1), 2, &["/s2.parquet"], &[]).await;
+
+        let table = build_table(
+            &tmp,
+            file_io,
+            vec![
+                snapshot(S1, None, 1, 1000, missing),
+                snapshot(S2, Some(S1), 2, 2000, s2_list),
+            ],
+            S2,
+            HashMap::new(),
+            vec![],
+            vec![],
+        );
+
+        // Strict: an unreadable expired snapshot aborts the call (matching Java), not skipped.
+        assert!(
+            unreferenced_files(&table, &HashSet::from([S1]))
+                .await
+                .is_err()
+        );
     }
 }
