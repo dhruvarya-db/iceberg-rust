@@ -30,7 +30,7 @@ const LOAD_CONCURRENCY: usize = 10;
 ///
 /// Paths are absolute and de-duplicated. A file referenced by any retained snapshot is never
 /// included, even if an expired snapshot also references it.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug)]
 pub struct UnreferencedFiles {
     /// Manifest-list (snapshot) files.
     pub manifest_lists: HashSet<String>,

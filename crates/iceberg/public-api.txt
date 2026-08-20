@@ -3279,16 +3279,8 @@ impl iceberg::transaction::UnreferencedFiles
 pub fn iceberg::transaction::UnreferencedFiles::all_paths(&self) -> impl core::iter::traits::iterator::Iterator<Item = &alloc::string::String>
 pub fn iceberg::transaction::UnreferencedFiles::is_empty(&self) -> bool
 pub fn iceberg::transaction::UnreferencedFiles::len(&self) -> usize
-impl core::clone::Clone for iceberg::transaction::UnreferencedFiles
-pub fn iceberg::transaction::UnreferencedFiles::clone(&self) -> iceberg::transaction::UnreferencedFiles
-impl core::cmp::Eq for iceberg::transaction::UnreferencedFiles
-impl core::cmp::PartialEq for iceberg::transaction::UnreferencedFiles
-pub fn iceberg::transaction::UnreferencedFiles::eq(&self, other: &iceberg::transaction::UnreferencedFiles) -> bool
-impl core::default::Default for iceberg::transaction::UnreferencedFiles
-pub fn iceberg::transaction::UnreferencedFiles::default() -> iceberg::transaction::UnreferencedFiles
 impl core::fmt::Debug for iceberg::transaction::UnreferencedFiles
 pub fn iceberg::transaction::UnreferencedFiles::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
-impl core::marker::StructuralPartialEq for iceberg::transaction::UnreferencedFiles
 pub trait iceberg::transaction::ApplyTransactionAction
 pub fn iceberg::transaction::ApplyTransactionAction::apply(self, tx: iceberg::transaction::Transaction) -> iceberg::Result<iceberg::transaction::Transaction>
 impl<T: TransactionAction + 'static> iceberg::transaction::ApplyTransactionAction for T
