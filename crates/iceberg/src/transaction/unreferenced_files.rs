@@ -78,7 +78,7 @@ impl UnreferencedFiles {
 ///
 /// `table` must be the metadata *before* expiry (still carrying the expired snapshots), and
 /// `expired_snapshot_ids` the ids about to be removed. The result is the reference-count difference
-/// `files(expired) − files(retained)`, mirroring Java `ReachableFileCleanup`: a file kept alive by
+/// `files(expired) - files(retained)`, mirroring Java `ReachableFileCleanup`: a file kept alive by
 /// any surviving snapshot is excluded.
 ///
 /// Data and delete files are only collected when the `gc.enabled` table property is `true`, matching
@@ -88,10 +88,10 @@ impl UnreferencedFiles {
 /// Reachability is resolved by reading manifests, so an I/O error matters: a failure to load a
 /// **retained** snapshot's manifest list, or to read one of its manifests, aborts the whole call
 /// (deleting a file we could not prove unreferenced would be unsafe). The same failure for an
-/// **expired** snapshot is skipped — that snapshot simply contributes nothing, leaving its files for
-/// a later orphan-cleanup pass.
+/// **expired** snapshot is skipped, so that snapshot simply contributes nothing — at worst this
+/// under-reports files, and never returns one that a retained snapshot still holds.
 ///
-/// This is metadata analysis only; no files are deleted.
+/// This only computes paths; it does not delete anything.
 pub async fn unreferenced_files(
     table: &Table,
     expired_snapshot_ids: &HashSet<i64>,
@@ -234,7 +234,7 @@ fn stats_paths(
     (statistics, partition_statistics)
 }
 
-/// `from − remove`, consuming `from`.
+/// `from - remove`, consuming `from`.
 fn difference(mut from: HashSet<String>, remove: &HashSet<String>) -> HashSet<String> {
     from.retain(|path| !remove.contains(path));
     from
