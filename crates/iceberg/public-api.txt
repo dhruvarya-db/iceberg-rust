@@ -2793,34 +2793,6 @@ pub fn iceberg::spec::TableMetadataBuilder::clone(&self) -> iceberg::spec::Table
 impl core::fmt::Debug for iceberg::spec::TableMetadataBuilder
 pub fn iceberg::spec::TableMetadataBuilder::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct iceberg::spec::TableProperties
-pub iceberg::spec::TableProperties::cdc_enabled: bool
-pub iceberg::spec::TableProperties::cdc_max_chunk_size: usize
-pub iceberg::spec::TableProperties::cdc_min_chunk_size: usize
-pub iceberg::spec::TableProperties::cdc_norm_level: i32
-pub iceberg::spec::TableProperties::commit_max_retry_wait_ms: u64
-pub iceberg::spec::TableProperties::commit_min_retry_wait_ms: u64
-pub iceberg::spec::TableProperties::commit_num_retries: usize
-pub iceberg::spec::TableProperties::commit_total_retry_timeout_ms: u64
-pub iceberg::spec::TableProperties::encryption_data_key_length: usize
-pub iceberg::spec::TableProperties::encryption_key_id: core::option::Option<alloc::string::String>
-pub iceberg::spec::TableProperties::gc_enabled: bool
-pub iceberg::spec::TableProperties::max_ref_age_ms: i64
-pub iceberg::spec::TableProperties::max_snapshot_age_ms: i64
-pub iceberg::spec::TableProperties::metadata_compression_codec: iceberg::compression::CompressionCodec
-pub iceberg::spec::TableProperties::min_snapshots_to_keep: usize
-pub iceberg::spec::TableProperties::parquet_compression_codec: iceberg::compression::CompressionCodec
-pub iceberg::spec::TableProperties::parquet_dict_size_bytes: usize
-pub iceberg::spec::TableProperties::parquet_page_row_limit: usize
-pub iceberg::spec::TableProperties::parquet_page_size_bytes: usize
-pub iceberg::spec::TableProperties::parquet_row_group_size_bytes: usize
-pub iceberg::spec::TableProperties::write_data_location: core::option::Option<alloc::string::String>
-pub iceberg::spec::TableProperties::write_datafusion_fanout_enabled: bool
-pub iceberg::spec::TableProperties::write_folder_storage_location: core::option::Option<alloc::string::String>
-pub iceberg::spec::TableProperties::write_format_default: alloc::string::String
-pub iceberg::spec::TableProperties::write_metadata_path: core::option::Option<alloc::string::String>
-pub iceberg::spec::TableProperties::write_object_storage_location: core::option::Option<alloc::string::String>
-pub iceberg::spec::TableProperties::write_object_storage_partitioned_paths: bool
-pub iceberg::spec::TableProperties::write_target_file_size_bytes: usize
 impl iceberg::spec::TableProperties
 pub const iceberg::spec::TableProperties::PROPERTY_COMMIT_MAX_RETRY_WAIT_MS: &str
 pub const iceberg::spec::TableProperties::PROPERTY_COMMIT_MAX_RETRY_WAIT_MS_DEFAULT: u64
@@ -3270,10 +3242,24 @@ pub fn iceberg::transaction::Transaction::update_table_properties(&self) -> iceb
 pub fn iceberg::transaction::Transaction::upgrade_table_version(&self) -> iceberg::transaction::upgrade_format_version::UpgradeFormatVersionAction
 impl core::clone::Clone for iceberg::transaction::Transaction
 pub fn iceberg::transaction::Transaction::clone(&self) -> iceberg::transaction::Transaction
+pub struct iceberg::transaction::UnreferencedFiles
+pub iceberg::transaction::UnreferencedFiles::data_files: std::collections::hash::set::HashSet<alloc::string::String>
+pub iceberg::transaction::UnreferencedFiles::delete_files: std::collections::hash::set::HashSet<alloc::string::String>
+pub iceberg::transaction::UnreferencedFiles::manifest_lists: std::collections::hash::set::HashSet<alloc::string::String>
+pub iceberg::transaction::UnreferencedFiles::manifests: std::collections::hash::set::HashSet<alloc::string::String>
+pub iceberg::transaction::UnreferencedFiles::partition_statistics_files: std::collections::hash::set::HashSet<alloc::string::String>
+pub iceberg::transaction::UnreferencedFiles::statistics_files: std::collections::hash::set::HashSet<alloc::string::String>
+impl iceberg::transaction::UnreferencedFiles
+pub fn iceberg::transaction::UnreferencedFiles::all_paths(&self) -> impl core::iter::traits::iterator::Iterator<Item = &alloc::string::String>
+pub fn iceberg::transaction::UnreferencedFiles::is_empty(&self) -> bool
+pub fn iceberg::transaction::UnreferencedFiles::len(&self) -> usize
+impl core::fmt::Debug for iceberg::transaction::UnreferencedFiles
+pub fn iceberg::transaction::UnreferencedFiles::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub trait iceberg::transaction::ApplyTransactionAction
 pub fn iceberg::transaction::ApplyTransactionAction::apply(self, tx: iceberg::transaction::Transaction) -> iceberg::Result<iceberg::transaction::Transaction>
 impl<T: TransactionAction + 'static> iceberg::transaction::ApplyTransactionAction for T
 pub fn T::apply(self, tx: iceberg::transaction::Transaction) -> iceberg::Result<iceberg::transaction::Transaction> where Self: core::marker::Sized
+pub async fn iceberg::transaction::unreferenced_files(table: &iceberg::table::Table, expired_snapshot_ids: &std::collections::hash::set::HashSet<i64>) -> iceberg::Result<iceberg::transaction::UnreferencedFiles>
 pub mod iceberg::transform
 pub trait iceberg::transform::TransformFunction: core::marker::Send + core::marker::Sync + core::fmt::Debug
 pub fn iceberg::transform::TransformFunction::transform(&self, input: arrow_array::array::ArrayRef) -> iceberg::Result<arrow_array::array::ArrayRef>
