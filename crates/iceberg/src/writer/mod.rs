@@ -387,6 +387,7 @@
 pub mod base_writer;
 pub mod file_writer;
 pub mod partitioning;
+pub mod sort_writer;
 
 use arrow_array::RecordBatch;
 
