@@ -375,11 +375,8 @@ impl Datum {
                 ));
             }
             PrimitiveType::Boolean => {
-                if bytes.len() == 1 && bytes[0] == 0u8 {
-                    PrimitiveLiteral::Boolean(false)
-                } else {
-                    PrimitiveLiteral::Boolean(true)
-                }
+                let [byte]: [u8; 1] = bytes.try_into()?;
+                PrimitiveLiteral::Boolean(byte != 0)
             }
             PrimitiveType::Int => PrimitiveLiteral::Int(i32::from_le_bytes(bytes.try_into()?)),
             PrimitiveType::Long => {

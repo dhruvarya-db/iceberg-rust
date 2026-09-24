@@ -487,9 +487,25 @@ fn json_map_rejects_mismatched_key_value_lengths() {
 
 #[test]
 fn avro_bytes_boolean() {
-    let bytes = vec![1u8];
+    for byte in u8::MIN..=u8::MAX {
+        check_avro_bytes_serde(vec![byte], Datum::bool(byte != 0), &PrimitiveType::Boolean);
+    }
+}
 
-    check_avro_bytes_serde(bytes, Datum::bool(true), &PrimitiveType::Boolean);
+#[test]
+fn boolean_from_empty_bytes() {
+    let error = Datum::try_from_bytes(&[], PrimitiveType::Boolean).unwrap_err();
+
+    assert_eq!(error.kind(), ErrorKind::DataInvalid);
+}
+
+#[test]
+fn boolean_from_multiple_bytes() {
+    for bytes in [&[0, 0][..], &[1, 0], &[0, 1], &[255, 255, 255]] {
+        let error = Datum::try_from_bytes(bytes, PrimitiveType::Boolean).unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+    }
 }
 
 #[test]
