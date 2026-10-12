@@ -175,6 +175,60 @@ impl serde_core::ser::Serialize for iceberg::compression::CompressionCodec
 pub fn iceberg::compression::CompressionCodec::serialize<S: serde_core::ser::Serializer>(&self, serializer: S) -> core::result::Result<<S as serde_core::ser::Serializer>::Ok, <S as serde_core::ser::Serializer>::Error>
 impl<'de> serde_core::de::Deserialize<'de> for iceberg::compression::CompressionCodec
 pub fn iceberg::compression::CompressionCodec::deserialize<D: serde_core::de::Deserializer<'de>>(deserializer: D) -> core::result::Result<Self, <D as serde_core::de::Deserializer>::Error>
+pub mod iceberg::cow_rewrite
+pub struct iceberg::cow_rewrite::CowBatchRewrite
+pub iceberg::cow_rewrite::CowBatchRewrite::changed: bool
+pub iceberg::cow_rewrite::CowBatchRewrite::output: core::option::Option<arrow_array::record_batch::RecordBatch>
+impl core::fmt::Debug for iceberg::cow_rewrite::CowBatchRewrite
+pub fn iceberg::cow_rewrite::CowBatchRewrite::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct iceberg::cow_rewrite::CowRewriteBuilder<'a>
+impl<'a> iceberg::cow_rewrite::CowRewriteBuilder<'a>
+pub fn iceberg::cow_rewrite::CowRewriteBuilder<'a>::new(table: &'a iceberg::table::Table) -> Self
+pub async fn iceberg::cow_rewrite::CowRewriteBuilder<'a>::rewrite(self) -> iceberg::Result<iceberg::cow_rewrite::CowRewriteResult>
+pub fn iceberg::cow_rewrite::CowRewriteBuilder<'a>::with_batch_size(self, batch_size: usize) -> Self
+pub fn iceberg::cow_rewrite::CowRewriteBuilder<'a>::with_case_sensitive(self, case_sensitive: bool) -> Self
+pub fn iceberg::cow_rewrite::CowRewriteBuilder<'a>::with_predicate(self, predicate: iceberg::expr::Predicate) -> Self
+pub fn iceberg::cow_rewrite::CowRewriteBuilder<'a>::with_rewriter(self, rewriter: alloc::sync::Arc<dyn iceberg::cow_rewrite::CowBatchRewriter>) -> Self
+pub fn iceberg::cow_rewrite::CowRewriteBuilder<'a>::with_snapshot_id(self, snapshot_id: i64) -> Self
+pub struct iceberg::cow_rewrite::CowRewriteFile
+impl iceberg::cow_rewrite::CowRewriteFile
+pub fn iceberg::cow_rewrite::CowRewriteFile::old_data_file(&self) -> &iceberg::spec::DataFile
+pub fn iceberg::cow_rewrite::CowRewriteFile::scan_task(&self) -> &iceberg::scan::FileScanTask
+impl core::clone::Clone for iceberg::cow_rewrite::CowRewriteFile
+pub fn iceberg::cow_rewrite::CowRewriteFile::clone(&self) -> iceberg::cow_rewrite::CowRewriteFile
+impl core::fmt::Debug for iceberg::cow_rewrite::CowRewriteFile
+pub fn iceberg::cow_rewrite::CowRewriteFile::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct iceberg::cow_rewrite::CowRewriteResult
+pub iceberg::cow_rewrite::CowRewriteResult::added_data_files: alloc::vec::Vec<iceberg::spec::DataFile>
+pub iceberg::cow_rewrite::CowRewriteResult::removed_data_files: alloc::vec::Vec<iceberg::spec::DataFile>
+pub iceberg::cow_rewrite::CowRewriteResult::stats: iceberg::cow_rewrite::CowRewriteStats
+pub iceberg::cow_rewrite::CowRewriteResult::unchanged_data_files: alloc::vec::Vec<iceberg::spec::DataFile>
+impl iceberg::cow_rewrite::CowRewriteResult
+pub fn iceberg::cow_rewrite::CowRewriteResult::has_changes(&self) -> bool
+impl core::default::Default for iceberg::cow_rewrite::CowRewriteResult
+pub fn iceberg::cow_rewrite::CowRewriteResult::default() -> iceberg::cow_rewrite::CowRewriteResult
+impl core::fmt::Debug for iceberg::cow_rewrite::CowRewriteResult
+pub fn iceberg::cow_rewrite::CowRewriteResult::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+pub struct iceberg::cow_rewrite::CowRewriteStats
+pub iceberg::cow_rewrite::CowRewriteStats::candidate_files: usize
+pub iceberg::cow_rewrite::CowRewriteStats::changed_batches: u64
+pub iceberg::cow_rewrite::CowRewriteStats::input_rows: u64
+pub iceberg::cow_rewrite::CowRewriteStats::output_rows: u64
+pub iceberg::cow_rewrite::CowRewriteStats::rewritten_files: usize
+pub iceberg::cow_rewrite::CowRewriteStats::unchanged_files: usize
+impl core::clone::Clone for iceberg::cow_rewrite::CowRewriteStats
+pub fn iceberg::cow_rewrite::CowRewriteStats::clone(&self) -> iceberg::cow_rewrite::CowRewriteStats
+impl core::cmp::Eq for iceberg::cow_rewrite::CowRewriteStats
+impl core::cmp::PartialEq for iceberg::cow_rewrite::CowRewriteStats
+pub fn iceberg::cow_rewrite::CowRewriteStats::eq(&self, other: &iceberg::cow_rewrite::CowRewriteStats) -> bool
+impl core::default::Default for iceberg::cow_rewrite::CowRewriteStats
+pub fn iceberg::cow_rewrite::CowRewriteStats::default() -> iceberg::cow_rewrite::CowRewriteStats
+impl core::fmt::Debug for iceberg::cow_rewrite::CowRewriteStats
+pub fn iceberg::cow_rewrite::CowRewriteStats::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
+impl core::marker::Copy for iceberg::cow_rewrite::CowRewriteStats
+impl core::marker::StructuralPartialEq for iceberg::cow_rewrite::CowRewriteStats
+pub trait iceberg::cow_rewrite::CowBatchRewriter: core::marker::Send + core::marker::Sync
+pub fn iceberg::cow_rewrite::CowBatchRewriter::rewrite_batch(&self, batch: arrow_array::record_batch::RecordBatch) -> iceberg::Result<iceberg::cow_rewrite::CowBatchRewrite>
 pub mod iceberg::encryption
 pub mod iceberg::encryption::kms
 pub struct iceberg::encryption::kms::GeneratedKey
@@ -1313,21 +1367,24 @@ pub fn iceberg::scan::FileScanTask::serialize<S>(&self, serializer: S) -> core::
 impl<'de> serde_core::de::Deserialize<'de> for iceberg::scan::FileScanTask
 pub fn iceberg::scan::FileScanTask::deserialize<__D>(__deserializer: __D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
 pub struct iceberg::scan::FileScanTaskDeleteFile
-pub iceberg::scan::FileScanTaskDeleteFile::content_offset: core::option::Option<i64>
-pub iceberg::scan::FileScanTaskDeleteFile::content_size_in_bytes: core::option::Option<i64>
-pub iceberg::scan::FileScanTaskDeleteFile::equality_ids: core::option::Option<alloc::vec::Vec<i32>>
-pub iceberg::scan::FileScanTaskDeleteFile::file_format: iceberg::spec::DataFileFormat
-pub iceberg::scan::FileScanTaskDeleteFile::file_path: alloc::string::String
-pub iceberg::scan::FileScanTaskDeleteFile::file_size_in_bytes: u64
-pub iceberg::scan::FileScanTaskDeleteFile::file_type: iceberg::spec::DataContentType
-pub iceberg::scan::FileScanTaskDeleteFile::key_metadata: core::option::Option<alloc::boxed::Box<[u8]>>
-pub iceberg::scan::FileScanTaskDeleteFile::partition_spec_id: i32
-pub iceberg::scan::FileScanTaskDeleteFile::record_count: core::option::Option<u64>
-pub iceberg::scan::FileScanTaskDeleteFile::referenced_data_file: core::option::Option<alloc::string::String>
+impl iceberg::scan::FileScanTaskDeleteFile
+pub fn iceberg::scan::FileScanTaskDeleteFile::content_offset(&self) -> core::option::Option<u64>
+pub fn iceberg::scan::FileScanTaskDeleteFile::content_size_in_bytes(&self) -> core::option::Option<u64>
+pub fn iceberg::scan::FileScanTaskDeleteFile::equality_ids(&self) -> core::option::Option<&[i32]>
+pub fn iceberg::scan::FileScanTaskDeleteFile::file_format(&self) -> iceberg::spec::DataFileFormat
+pub fn iceberg::scan::FileScanTaskDeleteFile::file_path(&self) -> &str
+pub fn iceberg::scan::FileScanTaskDeleteFile::file_size_in_bytes(&self) -> u64
+pub fn iceberg::scan::FileScanTaskDeleteFile::file_type(&self) -> iceberg::spec::DataContentType
+pub fn iceberg::scan::FileScanTaskDeleteFile::key_metadata(&self) -> core::option::Option<&[u8]>
+pub fn iceberg::scan::FileScanTaskDeleteFile::partition_spec_id(&self) -> i32
+pub fn iceberg::scan::FileScanTaskDeleteFile::record_count(&self) -> core::option::Option<u64>
+pub fn iceberg::scan::FileScanTaskDeleteFile::referenced_data_file(&self) -> core::option::Option<&str>
 impl core::clone::Clone for iceberg::scan::FileScanTaskDeleteFile
 pub fn iceberg::scan::FileScanTaskDeleteFile::clone(&self) -> iceberg::scan::FileScanTaskDeleteFile
 impl core::cmp::PartialEq for iceberg::scan::FileScanTaskDeleteFile
 pub fn iceberg::scan::FileScanTaskDeleteFile::eq(&self, other: &iceberg::scan::FileScanTaskDeleteFile) -> bool
+impl core::convert::From<iceberg::scan::FileScanTaskDeleteFile> for iceberg::Result<iceberg::scan::FileScanTaskDeleteFile>
+pub fn iceberg::Result<iceberg::scan::FileScanTaskDeleteFile>::from(task: iceberg::scan::FileScanTaskDeleteFile) -> Self
 impl core::fmt::Debug for iceberg::scan::FileScanTaskDeleteFile
 pub fn iceberg::scan::FileScanTaskDeleteFile::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::StructuralPartialEq for iceberg::scan::FileScanTaskDeleteFile
@@ -1358,6 +1415,7 @@ impl core::fmt::Debug for iceberg::scan::TableScan
 pub fn iceberg::scan::TableScan::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct iceberg::scan::TableScanBuilder<'a>
 impl<'a> iceberg::scan::TableScanBuilder<'a>
+pub fn iceberg::scan::TableScanBuilder<'a>::as_of_time(self, timestamp_ms: i64) -> Self
 pub fn iceberg::scan::TableScanBuilder<'a>::build(self) -> iceberg::Result<iceberg::scan::TableScan>
 pub fn iceberg::scan::TableScanBuilder<'a>::select(self, column_names: impl core::iter::traits::collect::IntoIterator<Item = impl alloc::string::ToString>) -> Self
 pub fn iceberg::scan::TableScanBuilder<'a>::select_all(self) -> Self
@@ -1636,16 +1694,15 @@ impl core::clone::Clone for iceberg::spec::PrimitiveLiteral
 pub fn iceberg::spec::PrimitiveLiteral::clone(&self) -> iceberg::spec::PrimitiveLiteral
 impl core::cmp::Eq for iceberg::spec::PrimitiveLiteral
 impl core::cmp::PartialEq for iceberg::spec::PrimitiveLiteral
-pub fn iceberg::spec::PrimitiveLiteral::eq(&self, other: &iceberg::spec::PrimitiveLiteral) -> bool
+pub fn iceberg::spec::PrimitiveLiteral::eq(&self, other: &Self) -> bool
 impl core::cmp::PartialOrd for iceberg::spec::PrimitiveLiteral
-pub fn iceberg::spec::PrimitiveLiteral::partial_cmp(&self, other: &iceberg::spec::PrimitiveLiteral) -> core::option::Option<core::cmp::Ordering>
+pub fn iceberg::spec::PrimitiveLiteral::partial_cmp(&self, other: &Self) -> core::option::Option<core::cmp::Ordering>
 impl core::convert::From<iceberg::spec::Datum> for iceberg::spec::PrimitiveLiteral
 pub fn iceberg::spec::PrimitiveLiteral::from(value: iceberg::spec::Datum) -> Self
 impl core::fmt::Debug for iceberg::spec::PrimitiveLiteral
 pub fn iceberg::spec::PrimitiveLiteral::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::hash::Hash for iceberg::spec::PrimitiveLiteral
 pub fn iceberg::spec::PrimitiveLiteral::hash<__H: core::hash::Hasher>(&self, state: &mut __H)
-impl core::marker::StructuralPartialEq for iceberg::spec::PrimitiveLiteral
 pub enum iceberg::spec::PrimitiveType
 pub iceberg::spec::PrimitiveType::Binary
 pub iceberg::spec::PrimitiveType::Boolean
@@ -2418,6 +2475,7 @@ pub fn iceberg::spec::Schema::field_by_alias(&self, alias: &str) -> core::option
 pub fn iceberg::spec::Schema::field_by_id(&self, field_id: i32) -> core::option::Option<&iceberg::spec::NestedFieldRef>
 pub fn iceberg::spec::Schema::field_by_name(&self, field_name: &str) -> core::option::Option<&iceberg::spec::NestedFieldRef>
 pub fn iceberg::spec::Schema::field_by_name_case_insensitive(&self, field_name: &str) -> core::option::Option<&iceberg::spec::NestedFieldRef>
+pub fn iceberg::spec::Schema::field_by_name_case_insensitive_checked(&self, field_name: &str) -> iceberg::Result<core::option::Option<&iceberg::spec::NestedFieldRef>>
 pub fn iceberg::spec::Schema::field_id_by_name(&self, name: &str) -> core::option::Option<i32>
 pub fn iceberg::spec::Schema::field_id_to_fields(&self) -> &std::collections::hash::map::HashMap<i32, iceberg::spec::NestedFieldRef>
 pub fn iceberg::spec::Schema::field_id_to_name_map(&self) -> &std::collections::hash::map::HashMap<i32, alloc::string::String>
@@ -2868,6 +2926,8 @@ pub const iceberg::spec::TableProperties<'_>::PROPERTY_UUID: &'static str
 pub const iceberg::spec::TableProperties<'_>::PROPERTY_WRITE_DATA_LOCATION: &'static str
 pub const iceberg::spec::TableProperties<'_>::PROPERTY_WRITE_FOLDER_STORAGE_LOCATION: &'static str
 pub const iceberg::spec::TableProperties<'_>::PROPERTY_WRITE_METADATA_PATH: &'static str
+pub const iceberg::spec::TableProperties<'_>::PROPERTY_WRITE_OBJECT_STORAGE_ENABLED: &'static str
+pub const iceberg::spec::TableProperties<'_>::PROPERTY_WRITE_OBJECT_STORAGE_ENABLED_DEFAULT: bool
 pub const iceberg::spec::TableProperties<'_>::PROPERTY_WRITE_OBJECT_STORAGE_LOCATION: &'static str
 pub const iceberg::spec::TableProperties<'_>::PROPERTY_WRITE_OBJECT_STORAGE_PARTITIONED_PATHS: &'static str
 pub const iceberg::spec::TableProperties<'_>::PROPERTY_WRITE_OBJECT_STORAGE_PARTITIONED_PATHS_DEFAULT: bool
@@ -2905,16 +2965,20 @@ pub fn iceberg::spec::TableProperties<'properties>::write_datafusion_fanout_enab
 pub fn iceberg::spec::TableProperties<'properties>::write_folder_storage_location(&self) -> iceberg::Result<core::option::Option<alloc::string::String>>
 pub fn iceberg::spec::TableProperties<'properties>::write_format_default(&self) -> iceberg::Result<alloc::string::String>
 pub fn iceberg::spec::TableProperties<'properties>::write_metadata_path(&self) -> iceberg::Result<core::option::Option<alloc::string::String>>
+pub fn iceberg::spec::TableProperties<'properties>::write_object_storage_enabled(&self) -> iceberg::Result<bool>
 pub fn iceberg::spec::TableProperties<'properties>::write_object_storage_location(&self) -> iceberg::Result<core::option::Option<alloc::string::String>>
 pub fn iceberg::spec::TableProperties<'properties>::write_object_storage_partitioned_paths(&self) -> iceberg::Result<bool>
 pub fn iceberg::spec::TableProperties<'properties>::write_target_file_size_bytes(&self) -> iceberg::Result<usize>
 impl<'properties> core::fmt::Debug for iceberg::spec::TableProperties<'properties>
 pub fn iceberg::spec::TableProperties<'properties>::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 pub struct iceberg::spec::UnboundPartitionField
-pub iceberg::spec::UnboundPartitionField::field_id: core::option::Option<i32>
-pub iceberg::spec::UnboundPartitionField::name: alloc::string::String
-pub iceberg::spec::UnboundPartitionField::source_id: i32
-pub iceberg::spec::UnboundPartitionField::transform: iceberg::spec::Transform
+impl iceberg::spec::UnboundPartitionField
+pub fn iceberg::spec::UnboundPartitionField::field_id(&self) -> core::option::Option<i32>
+pub fn iceberg::spec::UnboundPartitionField::name(&self) -> &str
+pub fn iceberg::spec::UnboundPartitionField::source_id(&self) -> iceberg::Result<i32>
+pub fn iceberg::spec::UnboundPartitionField::source_ids(&self) -> &[i32]
+pub fn iceberg::spec::UnboundPartitionField::transform(&self) -> iceberg::spec::Transform
+pub fn iceberg::spec::UnboundPartitionField::with_field_id(self, field_id: i32) -> Self
 impl core::clone::Clone for iceberg::spec::UnboundPartitionField
 pub fn iceberg::spec::UnboundPartitionField::clone(&self) -> iceberg::spec::UnboundPartitionField
 impl core::cmp::Eq for iceberg::spec::UnboundPartitionField
@@ -2922,6 +2986,8 @@ impl core::cmp::PartialEq for iceberg::spec::UnboundPartitionField
 pub fn iceberg::spec::UnboundPartitionField::eq(&self, other: &iceberg::spec::UnboundPartitionField) -> bool
 impl core::convert::From<iceberg::spec::PartitionField> for iceberg::spec::UnboundPartitionField
 pub fn iceberg::spec::UnboundPartitionField::from(field: iceberg::spec::PartitionField) -> Self
+impl core::convert::From<iceberg::spec::UnboundPartitionField> for iceberg::Result<iceberg::spec::UnboundPartitionField>
+pub fn iceberg::Result<iceberg::spec::UnboundPartitionField>::from(field: iceberg::spec::UnboundPartitionField) -> Self
 impl core::fmt::Debug for iceberg::spec::UnboundPartitionField
 pub fn iceberg::spec::UnboundPartitionField::fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::marker::StructuralPartialEq for iceberg::spec::UnboundPartitionField
@@ -2956,7 +3022,7 @@ impl<'de> serde_core::de::Deserialize<'de> for iceberg::spec::UnboundPartitionSp
 pub fn iceberg::spec::UnboundPartitionSpec::deserialize<__D>(__deserializer: __D) -> core::result::Result<Self, <__D as serde_core::de::Deserializer>::Error> where __D: serde_core::de::Deserializer<'de>
 pub struct iceberg::spec::UnboundPartitionSpecBuilder
 impl iceberg::spec::UnboundPartitionSpecBuilder
-pub fn iceberg::spec::UnboundPartitionSpecBuilder::add_partition_field(self, source_id: i32, target_name: impl alloc::string::ToString, transformation: iceberg::spec::Transform) -> iceberg::Result<Self>
+pub fn iceberg::spec::UnboundPartitionSpecBuilder::add_partition_field(self, field: iceberg::spec::UnboundPartitionField) -> iceberg::Result<Self>
 pub fn iceberg::spec::UnboundPartitionSpecBuilder::add_partition_fields(self, fields: impl core::iter::traits::collect::IntoIterator<Item = iceberg::spec::UnboundPartitionField>) -> iceberg::Result<Self>
 pub fn iceberg::spec::UnboundPartitionSpecBuilder::build(self) -> iceberg::spec::UnboundPartitionSpec
 pub fn iceberg::spec::UnboundPartitionSpecBuilder::new() -> Self
@@ -3224,10 +3290,6 @@ pub fn iceberg::table::TableBuilder::metadata<T: core::convert::Into<iceberg::sp
 pub fn iceberg::table::TableBuilder::metadata_location<T: core::convert::Into<alloc::string::String>>(self, metadata_location: T) -> Self
 pub fn iceberg::table::TableBuilder::readonly(self, readonly: bool) -> Self
 pub fn iceberg::table::TableBuilder::runtime(self, runtime: iceberg::Runtime) -> Self
-pub mod iceberg::test_utils
-pub fn iceberg::test_utils::check_record_batches(record_batches: alloc::vec::Vec<arrow_array::record_batch::RecordBatch>, expected_schema: expect_test::Expect, expected_data: expect_test::Expect, ignore_check_columns: &[&str], sort_column: core::option::Option<&str>)
-pub async fn iceberg::test_utils::make_encrypted_table() -> iceberg::table::Table
-pub fn iceberg::test_utils::test_runtime() -> iceberg::Runtime
 pub mod iceberg::transaction
 pub struct iceberg::transaction::ActionCommit
 impl iceberg::transaction::ActionCommit
@@ -3305,6 +3367,7 @@ pub mod iceberg::util::location
 pub mod iceberg::util::snapshot
 pub fn iceberg::util::snapshot::ancestors_between(table_metadata: &iceberg::spec::TableMetadataRef, latest_snapshot_id: i64, oldest_snapshot_id: core::option::Option<i64>) -> impl core::iter::traits::iterator::Iterator<Item = iceberg::spec::SnapshotRef> + core::marker::Send
 pub fn iceberg::util::snapshot::ancestors_of(table_metadata: &iceberg::spec::TableMetadataRef, snapshot_id: i64) -> impl core::iter::traits::iterator::Iterator<Item = iceberg::spec::SnapshotRef> + core::marker::Send
+pub fn iceberg::util::snapshot::snapshot_id_as_of_time(table_metadata: &iceberg::spec::TableMetadataRef, timestamp_ms: i64) -> iceberg::Result<i64>
 pub mod iceberg::writer
 pub mod iceberg::writer::base_writer
 pub mod iceberg::writer::base_writer::data_file_writer
