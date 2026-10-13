@@ -128,9 +128,29 @@ impl Transaction {
         let updated_table = Self::update_table_metadata(table, &updates)?;
 
         existing_updates.extend(updates);
-        existing_requirements.extend(requirements);
+        // A later action's requirement describes the table as the earlier actions left it, which
+        // the catalog has not seen. As in Java's `UpdateRequirements`, assert each kind of
+        // requirement once (once per ref for snapshot refs), against the transaction's base.
+        for requirement in requirements {
+            if !existing_requirements
+                .iter()
+                .any(|existing| Self::assert_same_state(existing, &requirement))
+            {
+                existing_requirements.push(requirement);
+            }
+        }
 
         Ok(updated_table)
+    }
+
+    fn assert_same_state(lhs: &TableRequirement, rhs: &TableRequirement) -> bool {
+        match (lhs, rhs) {
+            (
+                TableRequirement::RefSnapshotIdMatch { r#ref: lhs_ref, .. },
+                TableRequirement::RefSnapshotIdMatch { r#ref: rhs_ref, .. },
+            ) => lhs_ref == rhs_ref,
+            _ => std::mem::discriminant(lhs) == std::mem::discriminant(rhs),
+        }
     }
 
     /// Sets table to a new version.
@@ -261,12 +281,12 @@ mod tests {
     use crate::io::FileIO;
     use crate::memory::tests::new_memory_catalog;
     use crate::spec::{
-        DataContentType, DataFileBuilder, DataFileFormat, Literal, Struct, TableMetadata,
-        TableProperties,
+        DataContentType, DataFileBuilder, DataFileFormat, Literal, PrimitiveType, Struct,
+        TableMetadata, TableProperties, Transform, Type,
     };
     use crate::table::Table;
     use crate::test_utils::{make_encrypted_table, test_runtime};
-    use crate::transaction::{ApplyTransactionAction, Transaction};
+    use crate::transaction::{AddColumn, ApplyTransactionAction, Transaction};
     use crate::{Catalog, Error, ErrorKind, TableCreation, TableIdent};
 
     pub fn make_v1_table() -> Table {
@@ -463,6 +483,62 @@ mod tests {
             });
 
         mock_catalog
+    }
+
+    #[tokio::test]
+    async fn test_commit_actions_that_change_the_same_metadata() {
+        let catalog = new_memory_catalog().await;
+        let table = make_v3_minimal_table_in_catalog(&catalog).await;
+        // Fail fast instead of retrying a commit that can never succeed.
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .update_table_properties()
+            .set(
+                TableProperties::PROPERTY_COMMIT_NUM_RETRIES.to_string(),
+                "0".to_string(),
+            )
+            .apply(tx)
+            .unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .update_schema()
+            .add_column(AddColumn::optional(
+                "a",
+                Type::Primitive(PrimitiveType::Int),
+            ))
+            .apply(tx)
+            .unwrap();
+        let tx = tx
+            .update_schema()
+            .add_column(AddColumn::optional(
+                "b",
+                Type::Primitive(PrimitiveType::Int),
+            ))
+            .apply(tx)
+            .unwrap();
+        let tx = tx
+            .update_partition_spec()
+            .add_field("a", Transform::Bucket(4))
+            .apply(tx)
+            .unwrap();
+        let tx = tx
+            .update_partition_spec()
+            .add_field("b", Transform::Bucket(4))
+            .apply(tx)
+            .unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+
+        let metadata = table.metadata();
+        assert!(metadata.current_schema().field_by_name("b").is_some());
+        let names: Vec<_> = metadata
+            .default_partition_spec()
+            .fields()
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect();
+        assert_eq!(names, ["x", "a_bucket_4", "b_bucket_4"]);
     }
 
     #[tokio::test]
