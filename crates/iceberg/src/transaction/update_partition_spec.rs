@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 
-use crate::error::{Error, ErrorKind, Result, invalid_data};
+use crate::error::{Result, invalid_data};
 use crate::spec::{
     FormatVersion, PartitionField, PartitionSpec, SchemaRef, Transform, UnboundPartitionSpec,
 };
@@ -50,7 +50,8 @@ enum PendingChange {
 /// Changes are validated and resolved against the table metadata at commit time, so a commit
 /// that is retried after a concurrent update re-applies them to the refreshed spec. A new field
 /// with the same source and transform as a field of an earlier spec, and the same name if one
-/// is given, reuses that field and its field id. Format version 1 tables are not supported yet.
+/// is given, reuses that field and its field id. In format version 1, where field ids must stay
+/// sequential, a removed field is kept as a `void` field instead and field ids are not reused.
 ///
 /// # Example
 ///
@@ -154,12 +155,14 @@ impl UpdatePartitionSpecAction {
 
     fn resolve_spec<'a>(
         &self,
+        format_version: FormatVersion,
         schema: &'a SchemaRef,
         spec: &'a PartitionSpec,
         historical_specs: impl IntoIterator<Item = &'a PartitionSpec>,
         last_assigned_partition_id: i32,
     ) -> Result<UnboundPartitionSpec> {
         let mut update = PartitionSpecUpdate::new(
+            format_version,
             schema,
             spec,
             historical_specs,
@@ -189,14 +192,8 @@ impl UpdatePartitionSpecAction {
 impl TransactionAction for UpdatePartitionSpecAction {
     async fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
         let metadata = table.metadata();
-        if metadata.format_version() == FormatVersion::V1 {
-            return Err(Error::new(
-                ErrorKind::FeatureUnsupported,
-                "Updating the partition spec of a format version 1 table is not supported",
-            ));
-        }
-
         let spec = self.resolve_spec(
+            metadata.format_version(),
             metadata.current_schema(),
             metadata.default_partition_spec(),
             metadata.partition_specs_iter().map(|spec| spec.as_ref()),
@@ -221,6 +218,7 @@ impl TransactionAction for UpdatePartitionSpecAction {
 /// Applies partition field changes to a base spec, following Java's `BaseUpdatePartitionSpec`
 /// so that both produce the same spec for the same changes.
 struct PartitionSpecUpdate<'a> {
+    format_version: FormatVersion,
     schema: &'a SchemaRef,
     spec: &'a PartitionSpec,
     historical_fields: Vec<&'a PartitionField>,
@@ -238,6 +236,7 @@ struct PartitionSpecUpdate<'a> {
 
 impl<'a> PartitionSpecUpdate<'a> {
     fn new(
+        format_version: FormatVersion,
         schema: &'a SchemaRef,
         spec: &'a PartitionSpec,
         historical_specs: impl IntoIterator<Item = &'a PartitionSpec>,
@@ -259,6 +258,7 @@ impl<'a> PartitionSpecUpdate<'a> {
         historical_specs.sort_by_key(|spec| spec.spec_id());
 
         Ok(Self {
+            format_version,
             schema,
             spec,
             historical_fields: historical_specs
@@ -422,22 +422,32 @@ impl<'a> PartitionSpecUpdate<'a> {
     }
 
     fn apply(self) -> Result<UnboundPartitionSpec> {
-        let kept_fields = self
-            .spec
-            .fields()
-            .iter()
-            .filter(|field| !self.deletes.contains(&field.field_id))
-            .map(|field| PartitionField {
-                name: self
-                    .renames
-                    .get(&field.name)
-                    .cloned()
-                    .unwrap_or_else(|| field.name.clone()),
-                ..field.clone()
-            });
+        let mut fields = Vec::with_capacity(self.spec.fields().len() + self.adds.len());
+        for field in self.spec.fields() {
+            let name = self
+                .renames
+                .get(&field.name)
+                .cloned()
+                .unwrap_or_else(|| field.name.clone());
+            if !self.deletes.contains(&field.field_id) {
+                fields.push(PartitionField {
+                    name,
+                    ..field.clone()
+                });
+            } else if self.format_version == FormatVersion::V1 {
+                // Format version 1 assigns field ids by position, so a removed field must stay
+                // in the spec to keep the ids of the later fields; a void field reads as null.
+                fields.push(PartitionField {
+                    name,
+                    transform: Transform::Void,
+                    ..field.clone()
+                });
+            }
+        }
+        fields.extend(self.adds);
         Ok(UnboundPartitionSpec {
             spec_id: None,
-            fields: kept_fields.chain(self.adds).map(Into::into).collect(),
+            fields: fields.into_iter().map(Into::into).collect(),
         })
     }
 
@@ -454,21 +464,23 @@ impl<'a> PartitionSpecUpdate<'a> {
     }
 
     // Of several matching fields, reuse the highest field id, as Java's `TableMetadata` does.
+    // Format version 1 field ids are positional, so there a new field always gets a new id.
     fn recycle_or_create_field(
         &mut self,
         source_id: i32,
         transform: Transform,
         name: Option<&str>,
     ) -> Result<PartitionField> {
-        if let Some(field) = self
-            .historical_fields
-            .iter()
-            .filter(|field| {
-                field.source_id == source_id
-                    && field.transform == transform
-                    && name.is_none_or(|name| field.name == name)
-            })
-            .max_by_key(|field| field.field_id)
+        if self.format_version >= FormatVersion::V2
+            && let Some(field) = self
+                .historical_fields
+                .iter()
+                .filter(|field| {
+                    field.source_id == source_id
+                        && field.transform == transform
+                        && name.is_none_or(|name| field.name == name)
+                })
+                .max_by_key(|field| field.field_id)
         {
             return Ok((*field).clone());
         }
@@ -531,7 +543,7 @@ mod tests {
         SchemaRef, Transform, Type, UnboundPartitionSpec,
     };
     use crate::table::Table;
-    use crate::transaction::tests::{make_v1_table, make_v2_table};
+    use crate::transaction::tests::make_v2_table;
     use crate::transaction::{AddColumn, ApplyTransactionAction, Transaction, TransactionAction};
     use crate::{
         Catalog, ErrorKind, Result, TableCreation, TableIdent, TableRequirement, TableUpdate,
@@ -593,14 +605,33 @@ mod tests {
     }
 
     /// Applies `action` to `base` alone, with no earlier specs to reuse fields from.
+    fn evolve_as(
+        format_version: FormatVersion,
+        base: &PartitionSpec,
+        action: &UpdatePartitionSpecAction,
+    ) -> Result<Vec<PartitionField>> {
+        let schema = schema();
+        let last_assigned_partition_id = base.highest_field_id().unwrap_or(999);
+        let spec = action.resolve_spec(
+            format_version,
+            &schema,
+            base,
+            [],
+            last_assigned_partition_id,
+        )?;
+        Ok(spec.bind(schema)?.fields().to_vec())
+    }
+
+    /// Like [`evolve_as`], for changes whose outcome is the same in every format version.
     fn evolve(
         base: &PartitionSpec,
         action: UpdatePartitionSpecAction,
     ) -> Result<Vec<PartitionField>> {
-        let schema = schema();
-        let last_assigned_partition_id = base.highest_field_id().unwrap_or(999);
-        let spec = action.resolve_spec(&schema, base, [], last_assigned_partition_id)?;
-        Ok(spec.bind(schema)?.fields().to_vec())
+        let outcome = |format_version| {
+            evolve_as(format_version, base, &action).map_err(|err| err.message().to_string())
+        };
+        assert_eq!(outcome(FormatVersion::V1), outcome(FormatVersion::V2));
+        evolve_as(FormatVersion::V2, base, &action)
     }
 
     #[test]
@@ -688,53 +719,63 @@ mod tests {
 
     #[test]
     fn test_remove_field() {
-        let without_category = vec![
-            field(2, 1001, "ts_day", Transform::Day),
-            field(1, 1002, "shard", Transform::Bucket(16)),
+        let by_name = [
+            (update().remove_field("category"), 0),
+            (update().remove_field("shard"), 2),
         ];
-        let without_ts = vec![
-            field(3, 1000, "category", Transform::Identity),
-            field(1, 1002, "shard", Transform::Bucket(16)),
-        ];
-        let without_shard = vec![
-            field(3, 1000, "category", Transform::Identity),
-            field(2, 1001, "ts_day", Transform::Day),
-        ];
-        let cases = [
-            (update().remove_field("category"), &without_category),
-            (update().remove_field("shard"), &without_shard),
+        let by_transform = [
             (
                 update().remove_field_by_transform("category", Transform::Identity),
-                &without_category,
+                0,
             ),
-            (
-                update().remove_field_by_transform("ts", Transform::Day),
-                &without_ts,
-            ),
+            (update().remove_field_by_transform("ts", Transform::Day), 1),
             (
                 update().remove_field_by_transform("id", Transform::Bucket(16)),
-                &without_shard,
+                2,
             ),
         ];
-        for (action, expected) in cases {
-            assert_eq!(&evolve(&partitioned(), action).unwrap(), expected);
+        for (action, removed) in by_name.into_iter().chain(by_transform) {
+            // Format version 1 keeps the removed field as a void field; later ones drop it.
+            let mut v1_expected = partitioned_fields();
+            v1_expected[removed].transform = Transform::Void;
+            assert_eq!(
+                evolve_as(FormatVersion::V1, &partitioned(), &action).unwrap(),
+                v1_expected
+            );
+
+            let mut v2_expected = partitioned_fields();
+            v2_expected.remove(removed);
+            assert_eq!(
+                evolve_as(FormatVersion::V2, &partitioned(), &action).unwrap(),
+                v2_expected
+            );
         }
     }
 
     #[test]
     fn test_multiple_changes() {
-        let updated = evolve(
-            &partitioned(),
-            update()
-                .rename_field("shard", "id_bucket")
-                .remove_field_by_transform("ts", Transform::Day)
-                .add_field_with_name("prefix", "data", Transform::Truncate(4)),
+        let action = update()
+            .rename_field("shard", "id_bucket")
+            .remove_field_by_transform("ts", Transform::Day)
+            .add_field_with_name("prefix", "data", Transform::Truncate(4));
+
+        assert_eq!(
+            evolve_as(FormatVersion::V1, &partitioned(), &action).unwrap(),
+            vec![
+                field(3, 1000, "category", Transform::Identity),
+                field(2, 1001, "ts_day", Transform::Void),
+                field(1, 1002, "id_bucket", Transform::Bucket(16)),
+                field(4, 1003, "prefix", Transform::Truncate(4)),
+            ]
         );
-        assert_eq!(updated.unwrap(), vec![
-            field(3, 1000, "category", Transform::Identity),
-            field(1, 1002, "id_bucket", Transform::Bucket(16)),
-            field(4, 1003, "prefix", Transform::Truncate(4)),
-        ]);
+        assert_eq!(
+            evolve_as(FormatVersion::V2, &partitioned(), &action).unwrap(),
+            vec![
+                field(3, 1000, "category", Transform::Identity),
+                field(1, 1002, "id_bucket", Transform::Bucket(16)),
+                field(4, 1003, "prefix", Transform::Truncate(4)),
+            ]
+        );
     }
 
     #[test]
@@ -773,36 +814,53 @@ mod tests {
     #[test]
     fn test_replace_field_keeps_its_name() {
         let by_month = spec_of(vec![field(2, 1000, "ts_transformed", Transform::Month)]);
-        let updated = evolve(
-            &by_month,
-            update().remove_field("ts_transformed").add_field_with_name(
-                "ts_transformed",
-                "ts",
-                Transform::Day,
-            ),
-        );
-        assert_eq!(updated.unwrap(), vec![field(
-            2,
-            1001,
+        let action = update().remove_field("ts_transformed").add_field_with_name(
             "ts_transformed",
-            Transform::Day
-        )]);
+            "ts",
+            Transform::Day,
+        );
+
+        assert_eq!(
+            evolve_as(FormatVersion::V1, &by_month, &action).unwrap(),
+            vec![
+                field(2, 1000, "ts_transformed_1000", Transform::Void),
+                field(2, 1001, "ts_transformed", Transform::Day),
+            ]
+        );
+        assert_eq!(
+            evolve_as(FormatVersion::V2, &by_month, &action).unwrap(),
+            vec![field(2, 1001, "ts_transformed", Transform::Day)]
+        );
     }
 
     #[test]
     fn test_remove_and_add_field_over_several_updates() {
-        let mut spec = unpartitioned();
-        for action in [
-            update().add_field_with_name("ts_date", "ts", Transform::Day),
-            update().remove_field_by_transform("ts", Transform::Day),
-            update().add_field_with_name("ts_date", "ts", Transform::Day),
-            update().remove_field_by_transform("ts", Transform::Day),
-            update().add_field("ts", Transform::Month),
-            update().rename_field("ts_month", "ts_date"),
-        ] {
-            spec = spec_of(evolve(&spec, action).unwrap());
-        }
-        assert_eq!(spec.fields(), [field(2, 1000, "ts_date", Transform::Month)]);
+        let evolve_over_several_updates = |format_version| {
+            let mut spec = unpartitioned();
+            for action in [
+                update().add_field_with_name("ts_date", "ts", Transform::Day),
+                update().remove_field_by_transform("ts", Transform::Day),
+                update().add_field_with_name("ts_date", "ts", Transform::Day),
+                update().remove_field_by_transform("ts", Transform::Day),
+                update().add_field("ts", Transform::Month),
+                update().rename_field("ts_month", "ts_date"),
+            ] {
+                spec = spec_of(evolve_as(format_version, &spec, &action).unwrap());
+            }
+            spec.fields().to_vec()
+        };
+
+        assert_eq!(evolve_over_several_updates(FormatVersion::V1), vec![
+            field(2, 1000, "ts_date_1000", Transform::Void),
+            field(2, 1001, "ts_date_1001", Transform::Void),
+            field(2, 1002, "ts_date", Transform::Month),
+        ]);
+        assert_eq!(evolve_over_several_updates(FormatVersion::V2), vec![field(
+            2,
+            1000,
+            "ts_date",
+            Transform::Month
+        )]);
     }
 
     #[test]
@@ -851,9 +909,9 @@ mod tests {
         let schema = schema();
         let earlier = spec_of(vec![field(1, 1005, "id_bucket", Transform::Bucket(8))]);
         let base = partitioned();
-        let resolve = |action: UpdatePartitionSpecAction| {
+        let resolve = |format_version, action: UpdatePartitionSpecAction| {
             action
-                .resolve_spec(&schema, &base, [&earlier, &base], 1005)
+                .resolve_spec(format_version, &schema, &base, [&earlier, &base], 1005)
                 .unwrap()
                 .bind(schema.clone())
                 .unwrap()
@@ -864,16 +922,32 @@ mod tests {
         };
 
         assert_eq!(
-            resolve(update().add_field("id", Transform::Bucket(8))),
+            resolve(
+                FormatVersion::V2,
+                update().add_field("id", Transform::Bucket(8))
+            ),
             field(1, 1005, "id_bucket", Transform::Bucket(8))
         );
         assert_eq!(
-            resolve(update().add_field_with_name("id_bucket", "id", Transform::Bucket(8))),
+            resolve(
+                FormatVersion::V2,
+                update().add_field_with_name("id_bucket", "id", Transform::Bucket(8))
+            ),
             field(1, 1005, "id_bucket", Transform::Bucket(8))
         );
         assert_eq!(
-            resolve(update().add_field_with_name("id_b8", "id", Transform::Bucket(8))),
+            resolve(
+                FormatVersion::V2,
+                update().add_field_with_name("id_b8", "id", Transform::Bucket(8))
+            ),
             field(1, 1006, "id_b8", Transform::Bucket(8))
+        );
+        assert_eq!(
+            resolve(
+                FormatVersion::V1,
+                update().add_field("id", Transform::Bucket(8))
+            ),
+            field(1, 1006, "id_bucket_8", Transform::Bucket(8))
         );
 
         // Of several equivalent fields, the one with the highest field id is reused.
@@ -882,7 +956,13 @@ mod tests {
         let earliest = spec_of(vec![field(1, 1006, "id_b8", Transform::Bucket(8))]);
         let spec = update()
             .add_field("id", Transform::Bucket(8))
-            .resolve_spec(&schema, &base, [&earliest, &later, &earlier], 1007)
+            .resolve_spec(
+                FormatVersion::V2,
+                &schema,
+                &base,
+                [&earliest, &later, &earlier],
+                1007,
+            )
             .unwrap();
         assert_eq!(
             spec.fields().last().unwrap(),
@@ -1079,24 +1159,12 @@ mod tests {
         ]);
     }
 
-    #[tokio::test]
-    async fn test_commit_rejects_v1_table() {
-        let table = make_v1_table();
-        let action = update().add_identity("x");
-
-        let err = Arc::new(action)
-            .commit(&table)
-            .await
-            .err()
-            .expect("format version 1 tables should be rejected");
-
-        assert_eq!(err.kind(), ErrorKind::FeatureUnsupported);
-    }
-
     // Table-level cases of Java's `TestTableUpdatePartitionSpec`: the table starts with
     // `bucket(data, 16)` and every update is committed through a catalog.
 
-    async fn create_table(catalog: &impl Catalog) -> Table {
+    const FORMAT_VERSIONS: [FormatVersion; 2] = [FormatVersion::V1, FormatVersion::V2];
+
+    async fn create_table(catalog: &impl Catalog, format_version: FormatVersion) -> Table {
         let ident =
             TableIdent::from_strs([format!("ns-{}", uuid::Uuid::new_v4()), "t".into()]).unwrap();
         catalog
@@ -1112,13 +1180,13 @@ mod tests {
             .unwrap();
         let spec = UnboundPartitionSpec {
             spec_id: None,
-            fields: vec![field(2, 1000, "data_bucket", Transform::Bucket(16)).into()],
+            fields: vec![data_bucket().into()],
         };
         let creation = TableCreation::builder()
             .name(ident.name().to_string())
             .schema(schema)
             .partition_spec(spec)
-            .format_version(FormatVersion::V2)
+            .format_version(format_version)
             .build();
         catalog
             .create_table(ident.namespace(), creation)
@@ -1146,181 +1214,208 @@ mod tests {
         field(2, 1000, "data_bucket", Transform::Bucket(16))
     }
 
+    fn removed(field: PartitionField) -> PartitionField {
+        PartitionField {
+            transform: Transform::Void,
+            ..field
+        }
+    }
+
     #[tokio::test]
     async fn test_table_commit_updated_spec() {
         let catalog = new_memory_catalog().await;
-        let table = create_table(&catalog).await;
+        for format_version in FORMAT_VERSIONS {
+            let table = create_table(&catalog, format_version).await;
 
-        let table = commit(&catalog, &table, |tx| {
-            tx.update_partition_spec()
-                .add_field("id", Transform::Bucket(8))
-        })
-        .await;
-        assert_default_spec(&table, 1, vec![
-            data_bucket(),
-            field(1, 1001, "id_bucket_8", Transform::Bucket(8)),
-        ]);
-        assert_eq!(table.metadata().last_partition_id(), 1001);
+            let table = commit(&catalog, &table, |tx| {
+                tx.update_partition_spec()
+                    .add_field("id", Transform::Bucket(8))
+            })
+            .await;
+            let id_bucket_8 = field(1, 1001, "id_bucket_8", Transform::Bucket(8));
+            assert_default_spec(&table, 1, vec![data_bucket(), id_bucket_8.clone()]);
+            assert_eq!(table.metadata().last_partition_id(), 1001);
 
-        let table = commit(&catalog, &table, |tx| {
-            tx.update_partition_spec()
-                .remove_field("id_bucket_8")
-                .remove_field("data_bucket")
-                .add_field("data", Transform::Truncate(8))
-        })
-        .await;
-        assert_default_spec(&table, 2, vec![field(
-            2,
-            1002,
-            "data_trunc_8",
-            Transform::Truncate(8),
-        )]);
-        assert_eq!(table.metadata().last_partition_id(), 1002);
+            let table = commit(&catalog, &table, |tx| {
+                tx.update_partition_spec()
+                    .remove_field("id_bucket_8")
+                    .remove_field("data_bucket")
+                    .add_field("data", Transform::Truncate(8))
+            })
+            .await;
+            let data_trunc_8 = field(2, 1002, "data_trunc_8", Transform::Truncate(8));
+            let expected = match format_version {
+                FormatVersion::V1 => {
+                    vec![removed(data_bucket()), removed(id_bucket_8), data_trunc_8]
+                }
+                _ => vec![data_trunc_8],
+            };
+            assert_default_spec(&table, 2, expected);
+            assert_eq!(table.metadata().last_partition_id(), 1002);
+        }
     }
 
     #[tokio::test]
     async fn test_table_noop_commit_keeps_spec() {
         let catalog = new_memory_catalog().await;
-        let table = create_table(&catalog).await;
+        for format_version in FORMAT_VERSIONS {
+            let table = create_table(&catalog, format_version).await;
 
-        for action in [
-            update(),
-            update().rename_field("data_bucket", "data_bucket"),
-        ] {
-            let tx = action.apply(Transaction::new(&table)).unwrap();
-            let committed = tx.commit(&catalog).await.unwrap();
-            assert_default_spec(&committed, 0, vec![data_bucket()]);
-            assert_eq!(committed.metadata().partition_specs_iter().len(), 1);
+            for action in [
+                update(),
+                update().rename_field("data_bucket", "data_bucket"),
+            ] {
+                let tx = action.apply(Transaction::new(&table)).unwrap();
+                let committed = tx.commit(&catalog).await.unwrap();
+                assert_default_spec(&committed, 0, vec![data_bucket()]);
+                assert_eq!(committed.metadata().partition_specs_iter().len(), 1);
+            }
         }
     }
 
     #[tokio::test]
     async fn test_table_remove_and_add_fields() {
         let catalog = new_memory_catalog().await;
+        for format_version in FORMAT_VERSIONS {
+            let table = create_table(&catalog, format_version).await;
+            let table = commit(&catalog, &table, |tx| {
+                tx.update_partition_spec()
+                    .remove_field("data_bucket")
+                    .add_field("id", Transform::Bucket(8))
+            })
+            .await;
+            let id_bucket_8 = field(1, 1001, "id_bucket_8", Transform::Bucket(8));
+            let expected = match format_version {
+                FormatVersion::V1 => vec![removed(data_bucket()), id_bucket_8],
+                _ => vec![id_bucket_8],
+            };
+            assert_default_spec(&table, 1, expected);
 
-        let table = create_table(&catalog).await;
-        let table = commit(&catalog, &table, |tx| {
-            tx.update_partition_spec()
-                .remove_field("data_bucket")
-                .add_field("id", Transform::Bucket(8))
-        })
-        .await;
-        assert_default_spec(&table, 1, vec![field(
-            1,
-            1001,
-            "id_bucket_8",
-            Transform::Bucket(8),
-        )]);
-
-        let table = create_table(&catalog).await;
-        let table = commit(&catalog, &table, |tx| {
-            tx.update_partition_spec()
-                .add_field("data", Transform::Bucket(6))
-                .remove_field("data_bucket")
-        })
-        .await;
-        assert_default_spec(&table, 1, vec![field(
-            2,
-            1001,
-            "data_bucket_6",
-            Transform::Bucket(6),
-        )]);
-        assert_eq!(table.metadata().last_partition_id(), 1001);
+            let table = create_table(&catalog, format_version).await;
+            let table = commit(&catalog, &table, |tx| {
+                tx.update_partition_spec()
+                    .add_field("data", Transform::Bucket(6))
+                    .remove_field("data_bucket")
+            })
+            .await;
+            let data_bucket_6 = field(2, 1001, "data_bucket_6", Transform::Bucket(6));
+            let expected = match format_version {
+                FormatVersion::V1 => vec![removed(data_bucket()), data_bucket_6],
+                _ => vec![data_bucket_6],
+            };
+            assert_default_spec(&table, 1, expected);
+            assert_eq!(table.metadata().last_partition_id(), 1001);
+        }
     }
 
     #[tokio::test]
     async fn test_table_add_after_last_field_removed() {
         let catalog = new_memory_catalog().await;
-        let table = create_table(&catalog).await;
+        for format_version in FORMAT_VERSIONS {
+            let table = create_table(&catalog, format_version).await;
 
-        let table = commit(&catalog, &table, |tx| {
-            tx.update_partition_spec().remove_field("data_bucket")
-        })
-        .await;
-        assert_default_spec(&table, 1, vec![]);
-        assert_eq!(table.metadata().last_partition_id(), 1000);
+            let table = commit(&catalog, &table, |tx| {
+                tx.update_partition_spec().remove_field("data_bucket")
+            })
+            .await;
+            let kept = match format_version {
+                FormatVersion::V1 => vec![removed(data_bucket())],
+                _ => vec![],
+            };
+            assert_default_spec(&table, 1, kept.clone());
+            assert_eq!(table.metadata().last_partition_id(), 1000);
 
-        let table = commit(&catalog, &table, |tx| {
-            tx.update_partition_spec()
-                .add_field("id", Transform::Bucket(8))
-        })
-        .await;
-        assert_default_spec(&table, 2, vec![field(
-            1,
-            1001,
-            "id_bucket_8",
-            Transform::Bucket(8),
-        )]);
-        assert_eq!(table.metadata().last_partition_id(), 1001);
+            let table = commit(&catalog, &table, |tx| {
+                tx.update_partition_spec()
+                    .add_field("id", Transform::Bucket(8))
+            })
+            .await;
+            let mut expected = kept;
+            expected.push(field(1, 1001, "id_bucket_8", Transform::Bucket(8)));
+            assert_default_spec(&table, 2, expected);
+            assert_eq!(table.metadata().last_partition_id(), 1001);
+        }
     }
 
     #[tokio::test]
     async fn test_table_readded_field_reuses_its_field_id() {
         let catalog = new_memory_catalog().await;
-        let table = create_table(&catalog).await;
+        for format_version in FORMAT_VERSIONS {
+            let table = create_table(&catalog, format_version).await;
 
-        let table = commit(&catalog, &table, |tx| {
-            tx.update_partition_spec().remove_field("data_bucket")
-        })
-        .await;
-        let table = commit(&catalog, &table, |tx| {
-            tx.update_partition_spec()
-                .add_field("data", Transform::Bucket(16))
-        })
-        .await;
+            let table = commit(&catalog, &table, |tx| {
+                tx.update_partition_spec().remove_field("data_bucket")
+            })
+            .await;
+            let table = commit(&catalog, &table, |tx| {
+                tx.update_partition_spec()
+                    .add_field("data", Transform::Bucket(16))
+            })
+            .await;
 
-        // The re-added field matches spec 0, so that spec becomes the default again.
-        assert_default_spec(&table, 0, vec![data_bucket()]);
-        assert_eq!(table.metadata().last_partition_id(), 1000);
+            match format_version {
+                // Format version 1 never reuses a field id, so the field is added anew.
+                FormatVersion::V1 => assert_default_spec(&table, 2, vec![
+                    removed(data_bucket()),
+                    field(2, 1001, "data_bucket_16", Transform::Bucket(16)),
+                ]),
+                // The re-added field matches spec 0, so that spec becomes the default again.
+                _ => assert_default_spec(&table, 0, vec![data_bucket()]),
+            }
+        }
     }
 
     #[tokio::test]
     async fn test_table_add_second_time_granularity() {
         let catalog = new_memory_catalog().await;
-        let table = create_table(&catalog).await;
-        let tx = Transaction::new(&table);
-        let tx = tx
-            .update_schema()
-            .add_column(AddColumn::optional(
-                "ts",
-                Type::Primitive(PrimitiveType::Timestamptz),
-            ))
-            .apply(tx)
-            .unwrap();
-        let table = tx.commit(&catalog).await.unwrap();
+        for format_version in FORMAT_VERSIONS {
+            let table = create_table(&catalog, format_version).await;
+            let tx = Transaction::new(&table);
+            let tx = tx
+                .update_schema()
+                .add_column(AddColumn::optional(
+                    "ts",
+                    Type::Primitive(PrimitiveType::Timestamptz),
+                ))
+                .apply(tx)
+                .unwrap();
+            let table = tx.commit(&catalog).await.unwrap();
 
-        let table = commit(&catalog, &table, |tx| {
-            tx.update_partition_spec().add_field("ts", Transform::Day)
-        })
-        .await;
-        let table = commit(&catalog, &table, |tx| {
-            tx.update_partition_spec().add_field("ts", Transform::Hour)
-        })
-        .await;
+            let table = commit(&catalog, &table, |tx| {
+                tx.update_partition_spec().add_field("ts", Transform::Day)
+            })
+            .await;
+            let table = commit(&catalog, &table, |tx| {
+                tx.update_partition_spec().add_field("ts", Transform::Hour)
+            })
+            .await;
 
-        assert_default_spec(&table, 2, vec![
-            data_bucket(),
-            field(3, 1001, "ts_day", Transform::Day),
-            field(3, 1002, "ts_hour", Transform::Hour),
-        ]);
+            assert_default_spec(&table, 2, vec![
+                data_bucket(),
+                field(3, 1001, "ts_day", Transform::Day),
+                field(3, 1002, "ts_hour", Transform::Hour),
+            ]);
+        }
     }
 
     #[tokio::test]
     async fn test_table_add_non_default_spec() {
         let catalog = new_memory_catalog().await;
-        let table = create_table(&catalog).await;
+        for format_version in FORMAT_VERSIONS {
+            let table = create_table(&catalog, format_version).await;
 
-        let table = commit(&catalog, &table, |tx| {
-            tx.update_partition_spec()
-                .add_identity("id")
-                .add_non_default_spec()
-        })
-        .await;
+            let table = commit(&catalog, &table, |tx| {
+                tx.update_partition_spec()
+                    .add_identity("id")
+                    .add_non_default_spec()
+            })
+            .await;
 
-        assert_default_spec(&table, 0, vec![data_bucket()]);
-        assert_eq!(
-            table.metadata().partition_spec_by_id(1).unwrap().fields(),
-            [data_bucket(), field(1, 1001, "id", Transform::Identity)]
-        );
+            assert_default_spec(&table, 0, vec![data_bucket()]);
+            assert_eq!(
+                table.metadata().partition_spec_by_id(1).unwrap().fields(),
+                [data_bucket(), field(1, 1001, "id", Transform::Identity)]
+            );
+        }
     }
 }
