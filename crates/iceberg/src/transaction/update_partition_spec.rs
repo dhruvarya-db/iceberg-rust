@@ -532,7 +532,7 @@ mod tests {
     };
     use crate::table::Table;
     use crate::transaction::tests::{make_v1_table, make_v2_table};
-    use crate::transaction::{ApplyTransactionAction, Transaction, TransactionAction};
+    use crate::transaction::{AddColumn, ApplyTransactionAction, Transaction, TransactionAction};
     use crate::{
         Catalog, ErrorKind, Result, TableCreation, TableIdent, TableRequirement, TableUpdate,
     };
@@ -651,6 +651,21 @@ mod tests {
             field(1, 1002, "shard", Transform::Bucket(16)),
             field(4, 1003, "prefix", Transform::Truncate(4)),
         ]);
+    }
+
+    #[test]
+    fn test_add_second_time_granularity_on_same_source() {
+        // An evolved spec may keep two time granularities of a column, so that existing
+        // metadata keeps working, although a single update may not add both.
+        let by_day =
+            spec_of(evolve(&unpartitioned(), update().add_field("ts", Transform::Day)).unwrap());
+        assert_eq!(
+            evolve(&by_day, update().add_field("ts", Transform::Hour)).unwrap(),
+            vec![
+                field(2, 1000, "ts_day", Transform::Day),
+                field(2, 1001, "ts_hour", Transform::Hour),
+            ]
+        );
     }
 
     #[test]
@@ -788,6 +803,19 @@ mod tests {
             spec = spec_of(evolve(&spec, action).unwrap());
         }
         assert_eq!(spec.fields(), [field(2, 1000, "ts_date", Transform::Month)]);
+    }
+
+    #[test]
+    fn test_void_field_named_after_its_source_gives_up_its_name() {
+        // Removing identity(category) from a format version 1 spec leaves this void field.
+        let base = spec_of(vec![field(3, 1000, "category", Transform::Void)]);
+        assert_eq!(
+            evolve(&base, update().add_identity("category")).unwrap(),
+            vec![
+                field(3, 1000, "category_1000", Transform::Void),
+                field(3, 1001, "category", Transform::Identity),
+            ]
+        );
     }
 
     #[test]
@@ -1244,6 +1272,37 @@ mod tests {
         // The re-added field matches spec 0, so that spec becomes the default again.
         assert_default_spec(&table, 0, vec![data_bucket()]);
         assert_eq!(table.metadata().last_partition_id(), 1000);
+    }
+
+    #[tokio::test]
+    async fn test_table_add_second_time_granularity() {
+        let catalog = new_memory_catalog().await;
+        let table = create_table(&catalog).await;
+        let tx = Transaction::new(&table);
+        let tx = tx
+            .update_schema()
+            .add_column(AddColumn::optional(
+                "ts",
+                Type::Primitive(PrimitiveType::Timestamptz),
+            ))
+            .apply(tx)
+            .unwrap();
+        let table = tx.commit(&catalog).await.unwrap();
+
+        let table = commit(&catalog, &table, |tx| {
+            tx.update_partition_spec().add_field("ts", Transform::Day)
+        })
+        .await;
+        let table = commit(&catalog, &table, |tx| {
+            tx.update_partition_spec().add_field("ts", Transform::Hour)
+        })
+        .await;
+
+        assert_default_spec(&table, 2, vec![
+            data_bucket(),
+            field(3, 1001, "ts_day", Transform::Day),
+            field(3, 1002, "ts_hour", Transform::Hour),
+        ]);
     }
 
     #[tokio::test]
